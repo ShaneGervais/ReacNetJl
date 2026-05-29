@@ -17,6 +17,10 @@ Manifest.toml
 starlib.dat
 *.dat.zip
 
+# Scratch / legacy files
+notebook.jl
+old/
+
 # Generated outputs
 *.csv
 *.out
