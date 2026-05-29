@@ -1,0 +1,16 @@
+name = "ReacNetJl"
+uuid = "4e50f1f0-7fd7-4a56-a7a2-7b77f92c7f2d"
+authors = ["Shane Gervais"]
+version = "0.1.0"
+
+[deps]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65db5fabd2c4"
+
+[targets]
+test = ["Test"]

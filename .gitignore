@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+__MACOSX/
+
+# Julia generated files
+Manifest.toml
+*.ji
+.julia/
+
+# Editor / temporary files
+*.swp
+*.swo
+*~
+.~lock.*
+
+# Full STARLIB data files are large; keep them outside Git or use Git LFS later.
+starlib.dat
+*.dat.zip
+
+# Generated outputs
+*.csv
+*.out
+*.log
