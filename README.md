@@ -70,7 +70,7 @@ The network evolves
 
 For a single-zone post-processing network, this is an ODE system, not a PDE, because there are no spatial derivatives yet.
 
-## Roadmap milestones
+## AI GENERATED MILESTONES TO KEEP TRACK OF NETWORK STATUS AND WHAT I SHOULD IMPLEMENT
 
 ### Milestone 1: Species registry and abundance helpers
 
