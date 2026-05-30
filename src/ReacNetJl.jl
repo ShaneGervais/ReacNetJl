@@ -1684,15 +1684,14 @@ end
 function _backward_euler_jacobian(network::ReactionNetwork, Y_next::Vector{Float64}, residual::Vector{Float64}, Y::Vector{Float64}, t_next::Float64, dt::Float64, rho, T9, finite_difference_epsilon::Float64; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     n = length(Y_next)
     jacobian = Matrix{Float64}(undef, n, n)
-    perturbed = copy(Y_next)
 
-    for j in 1:n
-        saved = perturbed[j]
+    Base.Threads.@threads for j in 1:n
+        perturbed = copy(Y_next)
+        saved = Y_next[j]
         step = finite_difference_epsilon * max(abs(saved), 1.0)
         perturbed[j] = saved + step
         perturbed_residual = _backward_euler_residual(network, perturbed, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
         jacobian[:, j] .= (perturbed_residual .- residual) ./ step
-        perturbed[j] = saved
     end
 
     return jacobian

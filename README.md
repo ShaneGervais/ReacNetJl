@@ -51,6 +51,7 @@ Implemented so far:
 - adaptive solver diagnostics for accepted/rejected steps, timestep range, and Newton iterations
 - one-call single-zone post-processing from reaction labels and mass fractions
 - full trajectory-indexed PPN abundance output as `iso_massfXXXXX.DAT` files plus a wide mass-fraction CSV
+- threaded finite-difference Jacobian construction for backward Euler when Julia is started with multiple threads
 - tests for parsing, interpolation, fluxes, RHS calculation, time evolution, and user-facing workflows
 
 ## Quick single-zone workflow
@@ -160,6 +161,18 @@ Run it with:
 julia --project=. examples/single_zone_nova_ppn.jl
 ```
 
+For a threaded run, pass `--jobs`:
+
+```sh
+julia --project=. examples/single_zone_nova_ppn.jl --jobs 8
+```
+
+The script relaunches itself with eight Julia threads when needed. This
+parallelizes backward-Euler finite-difference Jacobian columns and parallelizes
+the per-timestep `.DAT` output writing. The one-zone ODE still advances forward
+in time sequentially, so this is not equivalent to splitting timesteps across
+workers.
+
 The script solves the active 97-reaction nova network with backward Euler and
 weak screening, then interpolates the abundance history onto the trajectory time
 grid. For the current 805-row trajectory it writes:
@@ -180,7 +193,7 @@ evolved by the solver. The generated `outputs/` directory is ignored by Git.
 For a quick formatting check without writing every trajectory state:
 
 ```sh
-NOVA_PPN_OUTPUT_STRIDE=100 julia --project=. examples/single_zone_nova_ppn.jl
+julia --project=. examples/single_zone_nova_ppn.jl --output-stride 100
 ```
 
 ## Physics Roadmap
@@ -498,6 +511,7 @@ Implemented in `examples/single_zone_nova_ppn.jl`:
 - `iso_massfXXXXX.DAT` mass-fraction files with template-like headers
 - wide `mass_fractions.csv` with one row per written trajectory state
 - inert/outside-network isotope carry-through from the initial abundance file
+- `--jobs N` threaded Jacobian and DAT-output work for faster local runs
 
 ---
 

@@ -1,3 +1,65 @@
+function usage()
+    return """
+    Usage:
+      julia --project=. examples/single_zone_nova_ppn.jl [--jobs N] [--output-stride N]
+
+    Options:
+      --jobs N           Number of Julia threads to use for threaded Jacobian and DAT output work.
+      --output-stride N  Write every Nth trajectory output state. Default: 1, or NOVA_PPN_OUTPUT_STRIDE.
+      --help             Show this message.
+    """
+end
+
+function parse_cli_args(args)
+    jobs = 1
+    output_stride = parse(Int, get(ENV, "NOVA_PPN_OUTPUT_STRIDE", "1"))
+    i = 1
+    while i <= length(args)
+        arg = args[i]
+        if arg == "--help" || arg == "-h"
+            println(usage())
+            exit(0)
+        elseif arg == "--jobs"
+            i < length(args) || throw(ArgumentError("--jobs requires an integer value"))
+            jobs = parse(Int, args[i + 1])
+            i += 2
+        elseif startswith(arg, "--jobs=")
+            jobs = parse(Int, split(arg, "="; limit=2)[2])
+            i += 1
+        elseif arg == "--output-stride"
+            i < length(args) || throw(ArgumentError("--output-stride requires an integer value"))
+            output_stride = parse(Int, args[i + 1])
+            i += 2
+        elseif startswith(arg, "--output-stride=")
+            output_stride = parse(Int, split(arg, "="; limit=2)[2])
+            i += 1
+        else
+            throw(ArgumentError("unknown argument '$arg'\n$(usage())"))
+        end
+    end
+
+    jobs >= 1 || throw(ArgumentError("--jobs must be at least 1"))
+    output_stride >= 1 || throw(ArgumentError("--output-stride must be at least 1"))
+    return (jobs=jobs, output_stride=output_stride)
+end
+
+function maybe_relaunch_with_threads(cli)
+    cli.jobs <= Base.Threads.nthreads() && return
+    get(ENV, "REACNETJL_PPN_RELAUNCHED", "0") == "1" && return
+
+    project = Base.active_project()
+    project_dir = project === nothing ? dirname(@__DIR__) : dirname(project)
+    env = copy(ENV)
+    env["REACNETJL_PPN_RELAUNCHED"] = "1"
+    env["JULIA_NUM_THREADS"] = string(cli.jobs)
+    cmd = `$(Base.julia_cmd()) --project=$project_dir --threads=$(cli.jobs) $(PROGRAM_FILE) $(ARGS)`
+    run(setenv(cmd, env))
+    exit()
+end
+
+const CLI = parse_cli_args(ARGS)
+maybe_relaunch_with_threads(CLI)
+
 using Printf
 using ReacNetJl
 
@@ -10,8 +72,9 @@ It writes one `iso_massfXXXXX.DAT` mass-fraction file per saved trajectory
 state, plus a wide CSV containing every isotope column. With the current
 805-row trajectory, the last default file is `iso_massf00804.DAT`.
 
-Set `NOVA_PPN_OUTPUT_STRIDE=1000` for quick checks. The default stride is 1,
-which writes every accepted solver state.
+Set `--jobs 8` to run threaded Jacobian construction and parallel DAT output
+writing with eight Julia threads. Set `--output-stride 1000` for quick checks.
+The default stride is 1, which writes every trajectory state.
 =#
 
 const YEAR_SECONDS = 365.25 * 24.0 * 60.0 * 60.0
@@ -329,6 +392,30 @@ function clean_previous_outputs(output_dir::AbstractString)
     end
 end
 
+function write_saved_iso_state(
+    output_index::Int,
+    output_dir::AbstractString,
+    output_times,
+    solver_times,
+    history,
+    profiles,
+    network::ReactionNetwork,
+    X_file::Dict{String,Float64},
+    records,
+    screening_model,
+)
+    step_number = output_index - 1
+    time_s = output_times[output_index]
+    previous_time_s = output_index == 1 ? time_s : output_times[output_index - 1]
+    T9 = profiles.T9(time_s)
+    rho = profiles.rho(time_s)
+    Y = interpolated_state(solver_times, history, time_s)
+    epsilon = energy_generation_rate(network, Y, rho, T9; screening=screening_model)
+    values = output_values(network, Y, X_file, records)
+    path = joinpath(output_dir, @sprintf("iso_massf%05d.DAT", step_number))
+    write_iso_massf_file(path, step_number, time_s, previous_time_s, T9, rho, epsilon, records, values)
+end
+
 project_root = dirname(@__DIR__)
 trajectory_path = required_file([joinpath(project_root, "trajectory.input")], "trajectory file")
 abundance_path = required_file(
@@ -339,7 +426,7 @@ template_candidates = [joinpath(project_root, "iso_massf00804.DAT")]
 template_index = findfirst(isfile, template_candidates)
 template_path = template_index === nothing ? nothing : template_candidates[template_index]
 output_dir = joinpath(project_root, "outputs", "single_zone_nova_ppn")
-output_stride = parse(Int, get(ENV, "NOVA_PPN_OUTPUT_STRIDE", "1"))
+output_stride = CLI.output_stride
 
 tables = read_starlib()
 network = network_from_labels(tables, labels)
@@ -381,28 +468,16 @@ records = build_output_records(template_path, network, X_file)
 output_times = trajectory.time
 indices = saved_indices(length(output_times), output_stride)
 clean_previous_outputs(output_dir)
+mkpath(output_dir)
 
-for output_index in indices
-    step_number = output_index - 1
-    time_s = output_times[output_index]
-    previous_time_s = output_index == 1 ? time_s : output_times[output_index - 1]
-    T9 = profiles.T9(time_s)
-    rho = profiles.rho(time_s)
-    Y = interpolated_state(times, history, time_s)
-    epsilon = energy_generation_rate(network, Y, rho, T9; screening=screening_model)
-    values = output_values(network, Y, X_file, records)
-    path = joinpath(output_dir, @sprintf("iso_massf%05d.DAT", step_number))
-    write_iso_massf_file(
-        path,
-        step_number,
-        time_s,
-        previous_time_s,
-        T9,
-        rho,
-        epsilon,
-        records,
-        values,
-    )
+if CLI.jobs > 1 && Base.Threads.nthreads() > 1
+    Base.Threads.@threads for i in eachindex(indices)
+        write_saved_iso_state(indices[i], output_dir, output_times, times, history, profiles, network, X_file, records, screening_model)
+    end
+else
+    for output_index in indices
+        write_saved_iso_state(output_index, output_dir, output_times, times, history, profiles, network, X_file, records, screening_model)
+    end
 end
 
 csv_path = joinpath(output_dir, "mass_fractions.csv")
@@ -421,6 +496,8 @@ println("input abundance raw total = ", sum(values(raw_X_file); init=0.0))
 println("active network initial mass = ", sum(values(X0); init=0.0))
 println("inert/outside-network initial mass = ", sum(values(X_file); init=0.0) - sum(values(X0); init=0.0))
 println("screening = ", screening_model)
+println("jobs requested = ", CLI.jobs)
+println("Julia threads = ", Base.Threads.nthreads())
 println("accepted timesteps = ", solver_stats.accepted_steps)
 println("rejected timesteps = ", solver_stats.rejected_steps)
 println("dt range = ", solver_stats.min_dt, " to ", solver_stats.max_dt, " s")
