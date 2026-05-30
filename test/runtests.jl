@@ -7,10 +7,14 @@ using Test
     @test normalize_species_name("α") == "he4"
     @test normalize_species_name("γ") == "gamma"
     @test normalize_species_name("p") == "p"
+    @test normalize_species_name("26Al*") == "al*6"
+    @test normalize_species_name("26Alm") == "al*6"
+    @test normalize_species_name("26Alg") == "al26"
 
     @test species_from_name("18F") == Species("f18", 9, 18)
     @test species_from_name("4He") == Species("he4", 2, 4)
     @test species_from_name("p") == Species("p", 1, 1)
+    @test species_from_name("26Al*") == Species("al*6", 13, 26)
     @test species_from_name("n") == Species("n", 0, 1)
     @test species_from_name("d") == Species("d", 1, 2)
     @test species_from_name("t") == Species("t", 1, 3)
@@ -50,6 +54,22 @@ end
     @test profiles.T9(0.35) ≈ 0.16
     @test profiles.rho(0.35) ≈ 2750.0
     @test_throws ArgumentError profiles.T9(-0.1)
+
+    metadata_path = tempname()
+    open(metadata_path, "w") do io
+        println(io, "# time T rho")
+        println(io, "AGEUNIT = YRS")
+        println(io, "TUNIT = T8K")
+        println(io, "RHOUNIT = LOG")
+        println(io, "0.0 1.0 3.0")
+        println(io, "1.0 2.0 4.0")
+    end
+    metadata_trajectory = read_trajectory(metadata_path)
+    rm(metadata_path; force=true)
+    @test metadata_trajectory.time[1] == 0.0
+    @test metadata_trajectory.time[2] ≈ 365.25 * 24.0 * 60.0 * 60.0
+    @test metadata_trajectory.T9 == [0.1, 0.2]
+    @test metadata_trajectory.rho == [1.0e3, 1.0e4]
 
     bad_path = tempname()
     open(bad_path, "w") do io
@@ -153,6 +173,11 @@ end
     @test identical_rhs[species_index["c12"]] ≈ -2.0 * identical_flux
     @test identical_rhs[species_index["mg24"]] ≈ identical_flux
 
+    identical_network = ReactionNetwork(["c12", "mg24"], [identical])
+    identical_balance = species_flux_balance(identical_network, [1.0e-2, 0.0], 10.0, 0.5)
+    @test identical_balance.destruction[identical_network.species_index["c12"]] ≈ 2.0 * identical_flux
+    @test identical_balance.production[identical_network.species_index["mg24"]] ≈ identical_flux
+
     p_boosted = network_rhs(Y, [two_body], species_index, 1000.0, 0.5; rate_p_values=[1.0])
     @test p_boosted[species_index["p"]] ≈ -2.0 * flux
 
@@ -179,6 +204,9 @@ end
     @test network.species_info == [Species("p", 1, 1), Species("f18", 9, 18), Species("he4", 2, 4), Species("o15", 8, 15)]
     @test network.species_index["f18"] == 2
     @test length(network.reactions) == 1
+    @test length(network.compiled_reactions) == 1
+    @test only(network.compiled_reactions).reactant_indices == [1, 2]
+    @test only(network.compiled_reactions).product_indices == [3, 4]
 
     Y_from_X = abundances_from_mass_fractions(
         network,
@@ -192,11 +220,30 @@ end
     @test X_from_Y["p"] == 0.7
     @test X_from_Y["f18"] ≈ 1.0e-5
     @test X_from_Y["he4"] == 0.28
+    @test total_mass_fraction(network, Y_from_X) ≈ 0.98001
+
+    test_history = [Y_from_X'; (2.0 .* Y_from_X)']
+    X_history = mass_fraction_history(network, test_history)
+    @test size(X_history) == (2, length(network.species))
+    @test X_history[1, network.species_index["f18"]] ≈ 1.0e-5
+
+    totals = total_mass_fraction_history(network, test_history)
+    @test totals ≈ [0.98001, 1.96002]
+    drift = mass_fraction_drift(network, test_history)
+    @test drift.initial ≈ 0.98001
+    @test drift.final ≈ 1.96002
+    @test drift.drift ≈ 0.98001
+    @test drift.max_abs_drift ≈ 0.98001
+    positivity = abundance_diagnostics(network, test_history)
+    @test positivity.min_abundance == 0.0
+    @test !positivity.has_negative_abundance
+    @test positivity.min_mass_fraction == 0.0
 
     @test sum(abundances_from_mass_fractions(network, Dict("p" => 7.0, "he4" => 3.0); normalize=true) .* [1, 18, 4, 15]) ≈ 1.0
     @test_throws ArgumentError abundances_from_mass_fractions(network, Dict("ne19" => 1.0))
     @test_throws ArgumentError abundances_from_mass_fractions(network, Dict("p" => 0.5); check_sum=true)
     @test_throws ArgumentError mass_fractions_from_abundances(network, [0.7])
+    @test_throws ArgumentError total_mass_fraction(network, [0.7])
 
     Y0 = [0.7, 1.0e-5, 0.0, 0.0]
     @test reaction_string(reaction) == "f18(p,he4)o15"
@@ -222,6 +269,13 @@ end
     @test balance.net ≈ rhs
     @test balance.destruction[network.species_index["p"]] ≈ fluxes[1]
     @test balance.production[network.species_index["o15"]] ≈ fluxes[1]
+
+    screening_factor = weak_screening_multiplier(network, reaction, Y0, 1000.0, 0.5)
+    @test screening_factor > 1.0
+    screened_fluxes = reaction_fluxes(network, Y0, 1000.0, 0.5; screening=:weak)
+    @test screened_fluxes[1] ≈ screening_factor * fluxes[1]
+    screened_rhs = network_rhs(Y0, network, 1000.0, 0.5; screening=:weak)
+    @test screened_rhs[network.species_index["f18"]] ≈ screening_factor * rhs[network.species_index["f18"]]
 
     edges = reaction_edges(network)
     @test length(edges) == 4
@@ -307,6 +361,19 @@ end
     _, p_history = solve_network(network, Y0, (0.0, 1.0e-3), 1.0e-4, 1000.0, 0.5; method=:rk4, rate_p_values=[1.0])
     @test p_history[end, network.species_index["f18"]] < history[end, network.species_index["f18"]]
 
+    be_times, be_history = solve_network(network, Y0, (0.0, 1.0e-3), 1.0e-4, 1000.0, 0.5; method=:backward_euler)
+    @test be_times[end] == 1.0e-3
+    @test be_history[end, network.species_index["f18"]] < Y0[network.species_index["f18"]]
+    @test be_history[end, network.species_index["o15"]] > Y0[network.species_index["o15"]]
+
+    be_stats_times, be_stats_history, be_stats = solve_network(network, Y0, (0.0, 1.0e-3), 1.0e-4, 1000.0, 0.5; method=:backward_euler, return_stats=true)
+    @test be_stats_times == be_times
+    @test be_stats_history ≈ be_history
+    @test be_stats.accepted_steps == length(be_stats_times) - 1
+    @test length(be_stats.newton_iterations) == be_stats.accepted_steps
+    @test be_stats.max_newton_iterations >= 0
+    @test be_stats.newton_failed_steps == 0
+
     mc = run_monte_carlo(network, Y0, (0.0, 1.0e-4), 1.0e-4, 1000.0, 0.5; nruns=3, seed=1234, store_histories=true)
     mc_repeat = run_monte_carlo(network, Y0, (0.0, 1.0e-4), 1.0e-4, 1000.0, 0.5; nruns=3, seed=1234)
     @test size(mc.final_abundances) == (3, length(network.species))
@@ -340,6 +407,44 @@ end
     @test size(adaptive_history, 1) == length(adaptive_times)
     @test adaptive_history[end, network.species_index["f18"]] < Y0[network.species_index["f18"]]
 
+    stats_times, stats_history, stats = solve_network_adaptive(
+        network,
+        Y0,
+        (0.0, 1.0e-3),
+        5.0e-4,
+        1000.0,
+        0.5;
+        max_fractional_change=0.05,
+        max_absolute_change=1.0e-8,
+        dt_min=1.0e-8,
+        dt_max=5.0e-4,
+        return_stats=true,
+    )
+    @test stats_times[end] ≈ 1.0e-3
+    @test size(stats_history, 1) == length(stats_times)
+    @test stats.accepted_steps == length(stats_times) - 1
+    @test stats.rejected_steps >= 0
+    @test stats.min_dt <= stats.max_dt
+    @test stats.max_absolute_change >= 0.0
+
+    be_adaptive_times, _, be_adaptive_stats = solve_network_adaptive(
+        network,
+        Y0,
+        (0.0, 1.0e-3),
+        5.0e-4,
+        1000.0,
+        0.5;
+        method=:backward_euler,
+        max_fractional_change=0.05,
+        max_absolute_change=1.0e-8,
+        dt_min=1.0e-8,
+        dt_max=5.0e-4,
+        return_stats=true,
+    )
+    @test be_adaptive_times[end] ≈ 1.0e-3
+    @test length(be_adaptive_stats.newton_iterations) == be_adaptive_stats.accepted_steps
+    @test be_adaptive_stats.newton_failed_steps >= 0
+
     trajectory = read_trajectory("test/data/fake_nova_trajectory.dat")
     profiles = trajectory_profiles(trajectory)
     traj_times, traj_history = solve_network_adaptive(network, Y0, (0.2, 2.2), 0.5, profiles.rho, profiles.T9; max_fractional_change=0.5, dt_min=1.0e-6, dt_max=0.5)
@@ -352,7 +457,9 @@ end
     @test_throws ArgumentError solve_network(network, Y0, (1.0, 0.0), 0.1, 1000.0, 0.5)
     @test_throws ArgumentError solve_network(network, Y0, (0.0, 1.0), -0.1, 1000.0, 0.5)
     @test_throws ArgumentError solve_network(network, Y0, (0.0, 1.0), 0.1, 1000.0, 0.5; method=:unknown)
+    @test_throws ArgumentError solve_network(network, Y0, (0.0, 1.0), 0.1, 1000.0, 0.5; method=:backward_euler, max_newton_iterations=0)
     @test_throws ArgumentError solve_network_adaptive(network, Y0, (0.0, 1.0), 0.1, 1000.0, 0.5; max_fractional_change=0.0)
+    @test_throws ArgumentError solve_network_adaptive(network, Y0, (0.0, 1.0), 0.1, 1000.0, 0.5; max_absolute_change=0.0)
 end
 
 @testset "read synthetic STARLIB table" begin
@@ -381,10 +488,15 @@ end
     @test table.T9[1] == 0.01
     @test table.rate[end] == 6.0e-11
     @test table.factor_uncertainty[end] == 2.0
+    report = starlib_chapter_report(tables)
+    @test report.total == 1
+    @test report.supported == 1
+    @test report.unsupported == 0
 
     matches = find_rate(tables, "18F(p,γ)19Ne")
     @test matches == tables
     @test find_rate(tables, "18F(p,γ)19Ne"; source="missing") == ReactionRateTable[]
+    @test isempty(find_reverse_rate(tables, "18F(p,γ)19Ne"))
 
     reaction = reaction_from_label(tables, "18F(p,γ)19Ne")
     @test reaction.reactants == ["p", "f18"]
@@ -401,4 +513,59 @@ end
     @test_throws ArgumentError reaction_from_label(duplicate_tables, "18F(p,γ)19Ne")
     @test reaction_from_label(duplicate_tables, "18F(p,γ)19Ne"; on_multiple=:first).rate_table == table
     @test_throws ArgumentError reaction_from_label(tables, "18F(p,α)15O")
+
+    al_path = tempname()
+    open(al_path, "w") do io
+        println(io, "4 p al*6 si27 isomer 7.69126")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 1.0e-12 * i, " ", 2.0)
+        end
+    end
+    al_tables = read_starlib(al_path)
+    rm(al_path; force=true)
+    al_reaction = reaction_from_label(al_tables, "26Al*(p,γ)27Si")
+    @test al_reaction.reactants == ["p", "al*6"]
+    @test al_reaction.products == ["si27"]
+
+    reverse_table = ReactionRateTable(2, ["ne19"], ["p", "f18"], "reverse", -3.529, table.T9, table.rate, table.factor_uncertainty)
+    reverse_matches = find_reverse_rate([table, reverse_table], "18F(p,γ)19Ne")
+    @test reverse_matches == [reverse_table]
+
+    result = solve_single_zone(
+        tables,
+        ["18F(p,γ)19Ne"],
+        Dict("p" => 0.7, "18F" => 1.0e-5, "19Ne" => 0.0),
+        (0.0, 1.0e-4),
+        1.0e-4,
+        1000.0,
+        0.5;
+        adaptive=false,
+    )
+    @test result.validation.valid
+    @test result.network.species == ["p", "f18", "ne19"]
+    @test result.initial_mass_fractions["f18"] ≈ 1.0e-5
+    @test result.final_mass_fractions["f18"] < result.initial_mass_fractions["f18"]
+    @test size(result.reaction_fluxes) == (length(result.times), length(result.network.reactions))
+    @test length(result.integrated_fluxes) == 1
+    @test size(result.mass_fraction_history) == size(result.abundances)
+    @test result.mass_fraction_drift.initial ≈ total_mass_fraction(result.network, result.abundances[1, :])
+    @test !result.abundance_diagnostics.has_negative_abundance
+    @test result.solver_stats.accepted_steps == length(result.times) - 1
+
+    unsupported_path = tempname()
+    open(unsupported_path, "w") do io
+        println(io, "9 p f18 he4 o15 ne19 unsupported 0.0")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 1.0e-12 * i, " ", 2.0)
+        end
+    end
+
+    unsupported_tables = read_starlib(unsupported_path)
+    rm(unsupported_path; force=true)
+    unsupported_report = starlib_chapter_report(unsupported_tables)
+    @test unsupported_report.total == 1
+    @test unsupported_report.supported == 0
+    @test unsupported_report.unsupported == 1
+    @test unsupported_report.unsupported_by_chapter[9] == 1
+    @test isempty(only(unsupported_tables).products)
 end

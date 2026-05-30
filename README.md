@@ -30,9 +30,109 @@ Implemented so far:
 
 - fixed-step explicit Euler integration
 - fixed-step RK4 integration
+- fixed-step backward Euler integration with finite-difference Newton iterations
 - constant or time-dependent `rho(t)` and `T9(t)`
-- basic rate multiplier support for future uncertainty studies
-- tests for parsing, interpolation, fluxes, RHS calculation, and time evolution
+- adaptive explicit timestep control
+- STARLIB factor-uncertainty sampling
+- Monte Carlo uncertainty runs
+- trajectory file reading and interpolation
+- metadata-aware trajectory input with `AGEUNIT`, `TUNIT`, and `RHOUNIT`
+- flux diagnostics and integrated reaction flows
+- total mass-fraction history and drift diagnostics
+- abundance positivity diagnostics
+- approximate weak charged-particle screening multiplier via `screening=:weak`
+- baryon-number and charge-conservation checks
+- explicit STARLIB reverse-rate lookup with `find_reverse_rate`
+- unsupported STARLIB chapter-layout reporting
+- STARLIB `26Al*` / `26Alm` isomer label support for the `al*6` entries
+- precomputed integer stoichiometry inside `ReactionNetwork`
+- adaptive solver diagnostics for accepted/rejected steps, timestep range, and Newton iterations
+- one-call single-zone post-processing from reaction labels and mass fractions
+- tests for parsing, interpolation, fluxes, RHS calculation, time evolution, and user-facing workflows
+
+## Quick single-zone workflow
+
+For interactive post-processing, the highest-level API is `solve_single_zone`:
+
+```julia
+using ReacNetJl
+
+tables = read_starlib()
+
+result = solve_single_zone(
+    tables,
+    ["18F(p,α)15O", "18F(p,γ)19Ne"],
+    Dict("p" => 0.70, "he4" => 0.28, "18F" => 1.0e-5, "15O" => 0.0, "19Ne" => 0.0),
+    (0.0, 1.0e-3),
+    1.0e-5,
+    1.0e3,
+    0.2;
+    adaptive=true,
+    method=:backward_euler,
+    screening=:weak,
+    max_fractional_change=0.05,
+    max_absolute_change=1.0e-10,
+)
+
+println(result.final_mass_fractions)
+println(result.integrated_fluxes)
+println(result.mass_fraction_drift)
+println(result.abundance_diagnostics)
+println(result.solver_stats)
+```
+
+This builds the network from STARLIB labels, validates reaction bookkeeping,
+converts mass fractions to abundances, evolves the one-zone ODE, and returns
+raw abundance histories, mass-fraction diagnostics, positivity diagnostics, and
+solver statistics.
+
+## Current Simulation Example
+
+`examples/mini_nova_network.jl` now uses `trajectory.input` from the project
+root when present. The file is parsed with:
+
+- `AGEUNIT = YRS`, converted to seconds
+- `TUNIT = T9K`
+- `RHOUNIT = CGS`
+
+The current mini nova example uses a 63-reaction, 52-species network over CNO,
+NeNa, MgAl, a Si-Ca extension, and explicit `26Al*` isomer channels. It runs
+with backward Euler and weak screening:
+
+```text
+validated reactions = 63
+species = 52
+screening = weak
+total mass fraction = 1.0 to about 1.0
+Newton failed steps = 0
+```
+
+This is now a real trajectory-driven post-processing calculation if
+`trajectory.input` is present, but it is still not a production nova model until
+the network, screening model, reverse rates, and energy feedback are validated
+for the target nova regime.
+
+## Physics Roadmap
+
+Implemented:
+
+- Explicit reverse-rate lookup with `find_reverse_rate`, for rates already
+  present in STARLIB.
+- Approximate weak charged-particle screening as a multiplicative rate factor.
+- `26Al*`/`26Alm` parsing to STARLIB's `al*6` isomer entries, including isomer
+  beta decay and proton capture in the mini network.
+
+Not implemented yet:
+
+- Reciprocal-rule reverse-rate synthesis. This needs nuclear partition
+  functions/statistical weights and careful detailed-balance bookkeeping; we
+  should not fake it from Q-values alone.
+- Strong/intermediate screening regimes. The current `screening=:weak` option
+  is an approximate Salpeter-style weak-screening multiplier.
+- Energy feedback coupling. Since post-processing follows prescribed
+  `T9(t), rho(t)`, energy release cannot change the temperature unless we add a
+  one-zone thermal equation such as `dT/dt = (epsilon_nuc - losses) / c_P`
+  with an equation of state, heat capacity, and expansion/cooling model.
 
 ## Core equations
 
@@ -72,7 +172,7 @@ For a single-zone post-processing network, this is an ODE system, not a PDE, bec
 
 ## AI GENERATED MILESTONES TO KEEP TRACK OF NETWORK STATUS AND WHAT I SHOULD IMPLEMENT
 
-### Milestone 1: Species registry and abundance helpers
+### Milestone 1: Species registry and abundance helpers — done
 
 Goal: make initial conditions physically grounded and easy to use.
 
@@ -91,7 +191,7 @@ Users usually specify initial composition as mass fractions. The solver evolves 
 
 ---
 
-### Milestone 2: Network construction from reaction labels
+### Milestone 2: Network construction from reaction labels — done
 
 Goal: make network creation easy from STARLIB data.
 
@@ -115,7 +215,7 @@ network = network_from_labels(
 
 ---
 
-### Milestone 3: First real single-zone example
+### Milestone 3: First real single-zone example — done
 
 Goal: demonstrate the current network on a physically relevant nova reaction.
 
@@ -145,11 +245,12 @@ Possible first network:
 
 ---
 
-### Milestone 4: Adaptive timestep control
+### Milestone 4: Adaptive timestep control — done
 
 Goal: make explicit integration safer without adding dependencies yet.
 
-Add a simple adaptive timestep option that limits the maximum fractional abundance change per step:
+Add a simple adaptive timestep option that limits the maximum fractional and
+absolute abundance change per step:
 
 ```math
 \max_i \left|\frac{\Delta Y_i}{Y_i}\right| < \epsilon
@@ -166,6 +267,7 @@ solve_network_adaptive(
     rho,
     T9;
     max_fractional_change=0.01,
+    max_absolute_change=1.0e-12,
 )
 ```
 
@@ -173,7 +275,7 @@ This is not a replacement for a stiff solver, but it will help avoid unstable fi
 
 ---
 
-### Milestone 5: STARLIB uncertainty sampling
+### Milestone 5: STARLIB uncertainty sampling — done
 
 Goal: use STARLIB factor uncertainties correctly.
 
@@ -214,7 +316,7 @@ times, history = solve_network(
 
 ---
 
-### Milestone 6: Monte Carlo driver
+### Milestone 6: Monte Carlo driver — done
 
 Goal: run repeated networks for uncertainty evaluation.
 
@@ -250,7 +352,7 @@ Output should eventually support:
 
 ---
 
-### Milestone 7: Conservation and physics checks
+### Milestone 7: Conservation and physics checks — done
 
 Goal: catch physically invalid reactions or bookkeeping mistakes.
 
@@ -295,7 +397,7 @@ This will initially be diagnostic only, not coupled back to temperature.
 
 ---
 
-### Milestone 9: Trajectory post-processing
+### Milestone 9: Trajectory post-processing — done
 
 Goal: evolve a single-zone network over hydrodynamic nova trajectories.
 
@@ -315,12 +417,14 @@ trajectory file -> T9(t), rho(t) -> solve_network
 
 ### Milestone 10: Stiff solver research and implementation
 
-Goal: move toward production-quality integration.
+Goal: move toward production-quality integration. The first dependency-free
+implicit option is now implemented as `method=:backward_euler`, using Newton
+iterations with a finite-difference dense Jacobian.
 
-Explicit Euler and RK4 are useful for learning and small tests, but real nuclear networks are often stiff. Later options:
+Explicit Euler and RK4 are useful for learning and small tests, but real nuclear networks are often stiff. The mini nova example now uses backward Euler by default and prints Newton statistics, positivity diagnostics, and a small `dt_max` convergence table.
 
-- implement a basic implicit backward Euler method
-- implement Newton iterations and finite-difference Jacobians
+Later options:
+
 - exploit sparse reaction-network structure
 - evaluate whether using SciML/DifferentialEquations.jl is worthwhile despite adding a dependency
 
@@ -379,12 +483,12 @@ The first STARLIB uncertainty propagation layer is now complete:
 
 Recommended next implementation order:
 
-1. Add adaptive timestep control for safer explicit integration.
-2. Improve weak decay / beta-decay label support and STARLIB chapter handling.
-3. Add optional CSV output for examples and Monte Carlo summaries.
-4. Add trajectory post-processing from `(time, T9, rho)` profiles.
-5. Research/implement a basic implicit method for stiff networks.
-6. Expand toward a larger nova ppn network once decay and timestep handling are safer.
+1. Add energy-generation diagnostics from reaction Q-values.
+2. Add optional CSV output for examples and Monte Carlo summaries.
+3. Add a one-zone thermal feedback mode with a simple EOS/heat-capacity model.
+4. Add reciprocal-rule reverse rates with partition-function support.
+5. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
+6. Improve unsupported STARLIB chapter parsing beyond reporting.
 
 ## Learning path
 

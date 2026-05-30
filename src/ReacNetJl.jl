@@ -1,5 +1,6 @@
 module ReacNetJl
 
+using LinearAlgebra
 using Random
 
 export Species,
@@ -15,11 +16,19 @@ export Species,
     read_starlib,
     read_trajectory,
     trajectory_profiles,
+    starlib_chapter_report,
     find_rate,
+    find_reverse_rate,
     reaction_from_label,
     network_from_labels,
+    weak_screening_multiplier,
     abundances_from_mass_fractions,
     mass_fractions_from_abundances,
+    mass_fraction_history,
+    total_mass_fraction,
+    total_mass_fraction_history,
+    mass_fraction_drift,
+    abundance_diagnostics,
     interpolate_rate,
     interpolate_factor_uncertainty,
     sampled_interpolate_rate,
@@ -35,7 +44,8 @@ export Species,
     network_rhs,
     solve_network,
     solve_network_adaptive,
-    run_monte_carlo
+    run_monte_carlo,
+    solve_single_zone
 
 #=
     Species
@@ -97,6 +107,18 @@ end
 
 Reaction(table::ReactionRateTable) = Reaction(table.reactants, table.products, table)
 
+struct CompiledReaction
+    reactant_indices::Vector{Int}
+    product_indices::Vector{Int}
+    reactant_species_indices::Vector{Int}
+    reactant_species_counts::Vector{Int}
+    product_species_indices::Vector{Int}
+    product_species_counts::Vector{Int}
+    stoichiometric_delta::Vector{Float64}
+    symmetry_factor::Float64
+    nreactants::Int
+end
+
 #=
     ReactionNetwork
 
@@ -111,6 +133,7 @@ struct ReactionNetwork
     species_info::Vector{Species}
     species_index::Dict{String,Int}
     reactions::Vector{Reaction}
+    compiled_reactions::Vector{CompiledReaction}
 end
 
 function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::AbstractVector{Reaction})
@@ -132,10 +155,11 @@ function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::A
         push!(normalized_reactions, Reaction(reactants, products, reaction.rate_table))
     end
 
-    return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions)
+    compiled_reactions = [_compile_reaction(reaction, species_index, length(normalized_species)) for reaction in normalized_reactions]
+    return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions, compiled_reactions)
 end
 
-const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib.dat")
+const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib_v610_120222.dat/starlib.dat")
 const STARLIB_ROWS_PER_REACTION = 60
 
 const _PARTICLE_ALIASES = Dict(
@@ -200,6 +224,24 @@ function normalize_species_name(name::AbstractString)
         return _PARTICLE_ALIASES[s]
     end
 
+    m = match(r"^(\d+)([a-z]+)\*$", s)
+    if m !== nothing
+        mass_number = m.captures[1]
+        symbol = m.captures[2]
+        return symbol * "*" * last(mass_number)
+    end
+
+    m = match(r"^(\d+)alm$", s)
+    if m !== nothing
+        mass_number = m.captures[1]
+        return "al*" * last(mass_number)
+    end
+
+    m = match(r"^(\d+)alg$", s)
+    if m !== nothing
+        return "al" * m.captures[1]
+    end
+
     m = match(r"^(\d+)([a-z]+)$", s)
     if m !== nothing
         return m.captures[2] * m.captures[1]
@@ -226,10 +268,21 @@ function species_from_name(name::AbstractString)
     end
 
     m = match(r"^([a-z]+)(\d+)$", normalized)
+    if m === nothing
+        star_match = match(r"^([a-z]+)\*(\d+)$", normalized)
+        if star_match !== nothing
+            symbol = star_match.captures[1]
+            mass_suffix = star_match.captures[2]
+            haskey(_ELEMENT_Z, symbol) || throw(ArgumentError("unknown element symbol '$symbol' in species '$name'"))
+            A = symbol == "al" && mass_suffix == "6" ? 26 : parse(Int, mass_suffix)
+            return Species(normalized, _ELEMENT_Z[symbol], A)
+        end
+    end
     m === nothing && throw(ArgumentError("could not infer species information from '$name'"))
 
     symbol = m.captures[1]
-    A = parse(Int, m.captures[2])
+    mass_suffix = m.captures[2]
+    A = symbol == "al" && mass_suffix == "6" ? 26 : parse(Int, mass_suffix)
     haskey(_ELEMENT_Z, symbol) || throw(ArgumentError("unknown element symbol '$symbol' in species '$name'"))
 
     return Species(normalized, _ELEMENT_Z[symbol], A)
@@ -355,6 +408,120 @@ function mass_fractions_from_abundances(network::ReactionNetwork, Y::AbstractVec
     return X
 end
 
+#=
+    mass_fraction_history(network, history)
+
+Convert an abundance-history matrix into a mass-fraction-history matrix with
+the same shape. Columns remain ordered like `network.species`.
+=#
+function mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix{<:Real})
+    size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
+
+    X_history = Matrix{Float64}(undef, size(history))
+    for j in axes(history, 2)
+        A = network.species_info[j].A
+        A > 0 || throw(ArgumentError("cannot convert abundance for species '$(network.species_info[j].name)' with A=$A"))
+        for i in axes(history, 1)
+            X_history[i, j] = mass_fraction_from_abundance(history[i, j], A)
+        end
+    end
+    return X_history
+end
+
+#=
+    total_mass_fraction(network, Y)
+
+Return `sum_i A_i Y_i` for one abundance state.
+=#
+function total_mass_fraction(network::ReactionNetwork, Y::AbstractVector{<:Real})
+    length(Y) == length(network.species) || throw(ArgumentError("Y length must match the number of network species"))
+
+    total = 0.0
+    for (i, species) in pairs(network.species_info)
+        species.A > 0 || throw(ArgumentError("cannot convert abundance for species '$(species.name)' with A=$(species.A)"))
+        total += mass_fraction_from_abundance(Y[i], species.A)
+    end
+    return total
+end
+
+#=
+    total_mass_fraction_history(network, history)
+
+Return the total mass fraction at every saved abundance-history row.
+=#
+function total_mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix{<:Real})
+    size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
+
+    totals = Vector{Float64}(undef, size(history, 1))
+    for i in axes(history, 1)
+        totals[i] = total_mass_fraction(network, view(history, i, :))
+    end
+    return totals
+end
+
+#=
+    mass_fraction_drift(network, history)
+
+Summarize total-mass-fraction drift over a history.
+=#
+function mass_fraction_drift(network::ReactionNetwork, history::AbstractMatrix{<:Real})
+    totals = total_mass_fraction_history(network, history)
+    initial = first(totals)
+    final = last(totals)
+    deviations = abs.(totals .- initial)
+    return (
+        initial=initial,
+        final=final,
+        drift=final - initial,
+        max_abs_drift=maximum(deviations),
+        min_total=minimum(totals),
+        max_total=maximum(totals),
+        totals=totals,
+    )
+end
+
+function _matrix_minimum_location(values::AbstractMatrix{<:Real})
+    min_value = Inf
+    min_row = 0
+    min_col = 0
+    for row in axes(values, 1)
+        for col in axes(values, 2)
+            value = Float64(values[row, col])
+            if value < min_value
+                min_value = value
+                min_row = row
+                min_col = col
+            end
+        end
+    end
+    return min_value, min_row, min_col
+end
+
+#=
+    abundance_diagnostics(network, history)
+
+Report positivity-oriented diagnostics for an abundance history, including the
+minimum abundance and minimum mass fraction with species/time indices.
+=#
+function abundance_diagnostics(network::ReactionNetwork, history::AbstractMatrix{<:Real})
+    size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
+
+    min_Y, min_Y_row, min_Y_col = _matrix_minimum_location(history)
+    X_history = mass_fraction_history(network, history)
+    min_X, min_X_row, min_X_col = _matrix_minimum_location(X_history)
+
+    return (
+        min_abundance=min_Y,
+        min_abundance_time_index=min_Y_row,
+        min_abundance_species=network.species[min_Y_col],
+        min_mass_fraction=min_X,
+        min_mass_fraction_time_index=min_X_row,
+        min_mass_fraction_species=network.species[min_X_col],
+        has_negative_abundance=min_Y < 0.0,
+        has_negative_mass_fraction=min_X < 0.0,
+    )
+end
+
 function _split_starlib_species(chapter::Int, species::Vector{String})
     if chapter == 1 && length(species) == 2
         return [species[1]], [species[2]]
@@ -367,6 +534,47 @@ function _split_starlib_species(chapter::Int, species::Vector{String})
     # Conservative fallback: keep the raw STARLIB order if this chapter is not
     # supported yet. We will expand this as the network grows.
     return species, String[]
+end
+
+function _supported_starlib_layout(chapter::Int, nspecies::Int)
+    return (chapter == 1 && nspecies == 2) ||
+           (chapter in (2, 4) && nspecies == 3) ||
+           (chapter in (4, 5) && nspecies == 4)
+end
+
+function _supported_rate_table(table::ReactionRateTable)
+    return !isempty(table.reactants) && !isempty(table.products)
+end
+
+#=
+    starlib_chapter_report(tables)
+
+Summarize which STARLIB chapter layouts were parsed into supported reactant and
+product bookkeeping. Unsupported rows are kept by `read_starlib`, but they are
+not suitable for network construction until their chapter layout is implemented.
+=#
+function starlib_chapter_report(tables::AbstractVector{ReactionRateTable})
+    supported_by_chapter = Dict{Int,Int}()
+    unsupported_by_chapter = Dict{Int,Int}()
+    unsupported_examples = ReactionRateTable[]
+
+    for table in tables
+        if _supported_rate_table(table)
+            supported_by_chapter[table.chapter] = get(supported_by_chapter, table.chapter, 0) + 1
+        else
+            unsupported_by_chapter[table.chapter] = get(unsupported_by_chapter, table.chapter, 0) + 1
+            length(unsupported_examples) < 10 && push!(unsupported_examples, table)
+        end
+    end
+
+    return (
+        total=length(tables),
+        supported=sum(values(supported_by_chapter); init=0),
+        unsupported=sum(values(unsupported_by_chapter); init=0),
+        supported_by_chapter=supported_by_chapter,
+        unsupported_by_chapter=unsupported_by_chapter,
+        unsupported_examples=unsupported_examples,
+    )
 end
 
 #=
@@ -397,23 +605,70 @@ Read a whitespace- or comma-separated trajectory file with columns:
 
     time_s  T9  rho
 
-Lines beginning with `#` and blank lines are ignored.
+Lines beginning with `#` and blank lines are ignored. Metadata assignments are
+also supported before the numeric rows:
+
+    AGEUNIT = SEC | YRS
+    TUNIT   = T9K | T8K
+    RHOUNIT = CGS | LOG
 =#
 function read_trajectory(path::AbstractString)
     time = Float64[]
     T9 = Float64[]
     rho = Float64[]
+    age_unit = "SEC"
+    temperature_unit = "T9K"
+    density_unit = "CGS"
 
     open(path, "r") do io
         for raw_line in eachline(io)
             line = strip(split(raw_line, '#'; limit=2)[1])
             isempty(line) && continue
+
+            if occursin("=", line)
+                key_value = split(line, '='; limit=2)
+                key = uppercase(strip(key_value[1]))
+                value = uppercase(strip(key_value[2]))
+                if key == "AGEUNIT"
+                    age_unit = value
+                elseif key == "TUNIT"
+                    temperature_unit = value
+                elseif key == "RHOUNIT"
+                    density_unit = value
+                end
+                continue
+            end
+
             fields = split(replace(line, ',' => ' '))
             length(fields) >= 3 || throw(ArgumentError("trajectory row must contain at least three columns: $raw_line"))
 
-            push!(time, parse(Float64, fields[1]))
-            push!(T9, parse(Float64, fields[2]))
-            push!(rho, parse(Float64, fields[3]))
+            time_value = parse(Float64, fields[1])
+            T_value = parse(Float64, fields[2])
+            rho_value = parse(Float64, fields[3])
+
+            if age_unit == "SEC"
+                push!(time, time_value)
+            elseif age_unit == "YRS"
+                push!(time, time_value * 365.25 * 24.0 * 60.0 * 60.0)
+            else
+                throw(ArgumentError("unsupported trajectory AGEUNIT=$age_unit; use SEC or YRS"))
+            end
+
+            if temperature_unit == "T9K"
+                push!(T9, T_value)
+            elseif temperature_unit == "T8K"
+                push!(T9, T_value / 10.0)
+            else
+                throw(ArgumentError("unsupported trajectory TUNIT=$temperature_unit; use T9K or T8K"))
+            end
+
+            if density_unit == "CGS"
+                push!(rho, rho_value)
+            elseif density_unit == "LOG"
+                push!(rho, 10.0^rho_value)
+            else
+                throw(ArgumentError("unsupported trajectory RHOUNIT=$density_unit; use CGS or LOG"))
+            end
         end
     end
 
@@ -449,8 +704,9 @@ function trajectory_profiles(trajectory::Trajectory)
     return (rho=rho_profile, T9=T9_profile)
 end
 
-function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH)
+function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH; warn_unsupported::Bool=false)
     tables = ReactionRateTable[]
+    unsupported_counts = Dict{Int,Int}()
 
     open(path, "r") do io
         line_number = 0
@@ -466,6 +722,9 @@ function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH)
             source = fields[end-1]
             q_value = parse(Float64, fields[end])
             species = normalize_species_name.(fields[2:end-2])
+            if !_supported_starlib_layout(chapter, length(species))
+                unsupported_counts[chapter] = get(unsupported_counts, chapter, 0) + 1
+            end
             reactants, products = _split_starlib_species(chapter, species)
 
             T9 = Float64[]
@@ -490,6 +749,11 @@ function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH)
         end
     end
 
+    if warn_unsupported && !isempty(unsupported_counts)
+        summary = join(["chapter $chapter: $count" for (chapter, count) in sort(collect(unsupported_counts))], ", ")
+        @warn "Unsupported STARLIB chapter layouts were kept as raw reactants with empty products: $summary"
+    end
+
     return tables
 end
 
@@ -502,6 +766,22 @@ Returns all matching tables because STARLIB can contain multiple sources.
 function find_rate(tables::AbstractVector{ReactionRateTable}, label::AbstractString; source=nothing)
     reactants, products = parse_reaction_label(label)
     matches = filter(t -> t.reactants == reactants && t.products == products, tables)
+
+    source === nothing && return matches
+    wanted = lowercase(strip(string(source)))
+    return filter(t -> lowercase(t.source) == wanted, matches)
+end
+
+#=
+    find_reverse_rate(tables, label; source=nothing)
+
+Find STARLIB tables whose parsed reactants/products are the exact reverse of a
+reaction label. This detects explicit reverse rates already present in STARLIB;
+it does not synthesize reciprocal-rule reverse rates.
+=#
+function find_reverse_rate(tables::AbstractVector{ReactionRateTable}, label::AbstractString; source=nothing)
+    reactants, products = parse_reaction_label(label)
+    matches = filter(t -> t.reactants == products && t.products == reactants, tables)
 
     source === nothing && return matches
     wanted = lowercase(strip(string(source)))
@@ -633,14 +913,6 @@ function sampled_interpolate_rate(table::ReactionRateTable, T9::Real, p::Real)
     return rate * factor_uncertainty^Float64(p)
 end
 
-function _species_counts(species::Vector{String})
-    counts = Dict{String,Int}()
-    for name in species
-        counts[name] = get(counts, name, 0) + 1
-    end
-    return counts
-end
-
 function _factorial(n::Int)
     value = 1
     for i in 2:n
@@ -651,8 +923,15 @@ end
 
 function _symmetry_factor(species::Vector{String})
     factor = 1
-    for count in values(_species_counts(species))
-        factor *= _factorial(count)
+    for i in eachindex(species)
+        count = 0
+        for j in eachindex(species)
+            species[j] == species[i] && (count += 1)
+        end
+
+        if findfirst(==(species[i]), species) == i
+            factor *= _factorial(count)
+        end
     end
     return factor
 end
@@ -660,6 +939,109 @@ end
 function _species_index(index::AbstractDict, name::String)
     haskey(index, name) && return index[name]
     throw(ArgumentError("species '$name' is missing from the species index"))
+end
+
+function _index_counts(indices::Vector{Int})
+    unique_indices = Int[]
+    counts = Int[]
+    for index in indices
+        position = findfirst(==(index), unique_indices)
+        if position === nothing
+            push!(unique_indices, index)
+            push!(counts, 1)
+        else
+            counts[position] += 1
+        end
+    end
+    return unique_indices, counts
+end
+
+function _compile_reaction(reaction::Reaction, species_index::AbstractDict, nspecies::Int)
+    reactant_indices = [_species_index(species_index, name) for name in reaction.reactants]
+    product_indices = [_species_index(species_index, name) for name in reaction.products]
+    reactant_species_indices, reactant_species_counts = _index_counts(reactant_indices)
+    product_species_indices, product_species_counts = _index_counts(product_indices)
+    stoichiometric_delta = zeros(Float64, nspecies)
+
+    for (index, count) in zip(reactant_species_indices, reactant_species_counts)
+        stoichiometric_delta[index] -= count
+    end
+    for (index, count) in zip(product_species_indices, product_species_counts)
+        stoichiometric_delta[index] += count
+    end
+
+    return CompiledReaction(
+        reactant_indices,
+        product_indices,
+        reactant_species_indices,
+        reactant_species_counts,
+        product_species_indices,
+        product_species_counts,
+        stoichiometric_delta,
+        Float64(_symmetry_factor(reaction.reactants)),
+        length(reaction.reactants),
+    )
+end
+
+function _screening_composition_factor(network::ReactionNetwork, Y::AbstractVector{<:Real})
+    factor = 0.0
+    for (i, species) in pairs(network.species_info)
+        species.Z <= 0 && continue
+        factor += (species.Z^2 + species.Z) * max(Float64(Y[i]), 0.0)
+    end
+    return factor
+end
+
+#=
+    weak_screening_multiplier(network, reaction, Y, rho, T9)
+
+Return an approximate weak-screening multiplier for charged-particle reactions.
+This is a Salpeter-style diagnostic multiplier using the current abundance
+composition. Reactions with fewer than two charged reactants return `1.0`.
+=#
+function weak_screening_multiplier(
+    network::ReactionNetwork,
+    reaction::Reaction,
+    Y::AbstractVector{<:Real},
+    rho::Real,
+    T9::Real;
+    max_exponent::Real=300.0,
+)
+    length(reaction.reactants) >= 2 || return 1.0
+    T6 = 1000.0 * Float64(T9)
+    T6 > 0.0 || throw(ArgumentError("T9 must be positive for screening"))
+    rho_value = Float64(rho)
+    rho_value > 0.0 || throw(ArgumentError("rho must be positive for screening"))
+
+    zeta = _screening_composition_factor(network, Y)
+    zeta > 0.0 || return 1.0
+
+    exponent = 0.0
+    reactant_info = [species_from_name(name) for name in reaction.reactants]
+    for i in 1:(length(reactant_info)-1)
+        Zi = reactant_info[i].Z
+        Zi <= 0 && continue
+        for j in (i+1):length(reactant_info)
+            Zj = reactant_info[j].Z
+            Zj <= 0 && continue
+            exponent += 0.188 * Zi * Zj * sqrt(rho_value * zeta / T6^3)
+        end
+    end
+
+    exponent <= 0.0 && return 1.0
+    return exp(min(exponent, Float64(max_exponent)))
+end
+
+function _screening_multiplier(screening, network::ReactionNetwork, reaction::Reaction, Y::AbstractVector{<:Real}, rho::Real, T9::Real)
+    if screening === nothing || screening === false
+        return 1.0
+    elseif screening == :weak
+        return weak_screening_multiplier(network, reaction, Y, rho, T9)
+    elseif screening isa Function
+        return Float64(screening(network, reaction, Y, rho, T9))
+    end
+
+    throw(ArgumentError("unsupported screening=$screening; use nothing, :weak, or a function `(network, reaction, Y, rho, T9) -> multiplier`"))
 end
 
 #=
@@ -697,6 +1079,30 @@ function reaction_flux(
     return density_factor * rate * abundance_product / _symmetry_factor(reaction.reactants)
 end
 
+function _reaction_flux(
+    network::ReactionNetwork,
+    reaction::Reaction,
+    compiled::CompiledReaction,
+    Y::AbstractVector{<:Real},
+    rho::Real,
+    T9::Real;
+    rate_multiplier::Real=1.0,
+    rate_p_value=nothing,
+    screening=nothing,
+)
+    compiled.nreactants >= 1 || throw(ArgumentError("reaction must have at least one reactant"))
+
+    base_rate = rate_p_value === nothing ? interpolate_rate(reaction.rate_table, T9) : sampled_interpolate_rate(reaction.rate_table, T9, rate_p_value)
+    rate = rate_multiplier * _screening_multiplier(screening, network, reaction, Y, rho, T9) * base_rate
+    abundance_product = 1.0
+    for index in compiled.reactant_indices
+        abundance_product *= Y[index]
+    end
+
+    density_factor = Float64(rho)^(compiled.nreactants - 1)
+    return density_factor * rate * abundance_product / compiled.symmetry_factor
+end
+
 #=
     network_rhs(Y, reactions, species_index, rho, T9; rate_multipliers=nothing)
 
@@ -729,12 +1135,12 @@ function network_rhs(
         p_value = rate_p_values === nothing ? nothing : rate_p_values[reaction_number]
         flux = reaction_flux(reaction, Y, species_index, rho, T9; rate_multiplier=multiplier, rate_p_value=p_value)
 
-        for (name, count) in _species_counts(reaction.reactants)
-            dYdt[_species_index(species_index, name)] -= count * flux
+        for name in reaction.reactants
+            dYdt[_species_index(species_index, name)] -= flux
         end
 
-        for (name, count) in _species_counts(reaction.products)
-            dYdt[_species_index(species_index, name)] += count * flux
+        for name in reaction.products
+            dYdt[_species_index(species_index, name)] += flux
         end
     end
 
@@ -748,8 +1154,30 @@ function network_rhs(
     T9::Real;
     rate_multipliers=nothing,
     rate_p_values=nothing,
+    screening=nothing,
 )
-    return network_rhs(Y, network.reactions, network.species_index, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+    dYdt = zeros(Float64, length(Y))
+
+    length(Y) == length(network.species) || throw(ArgumentError("Y length must match the number of network species"))
+    if rate_multipliers !== nothing && length(rate_multipliers) != length(network.reactions)
+        throw(ArgumentError("rate_multipliers must have the same length as reactions"))
+    end
+    if rate_p_values !== nothing && length(rate_p_values) != length(network.reactions)
+        throw(ArgumentError("rate_p_values must have the same length as reactions"))
+    end
+
+    for (reaction_number, reaction) in pairs(network.reactions)
+        compiled = network.compiled_reactions[reaction_number]
+        multiplier = rate_multipliers === nothing ? 1.0 : rate_multipliers[reaction_number]
+        p_value = rate_p_values === nothing ? nothing : rate_p_values[reaction_number]
+        flux = _reaction_flux(network, reaction, compiled, Y, rho, T9; rate_multiplier=multiplier, rate_p_value=p_value, screening=screening)
+
+        for i in eachindex(dYdt)
+            dYdt[i] += compiled.stoichiometric_delta[i] * flux
+        end
+    end
+
+    return dYdt
 end
 
 #=
@@ -796,6 +1224,7 @@ function reaction_fluxes(
     T9::Real;
     rate_multipliers=nothing,
     rate_p_values=nothing,
+    screening=nothing,
 )
     if rate_multipliers !== nothing && length(rate_multipliers) != length(network.reactions)
         throw(ArgumentError("rate_multipliers must have the same length as network.reactions"))
@@ -808,7 +1237,7 @@ function reaction_fluxes(
     for (i, reaction) in pairs(network.reactions)
         multiplier = rate_multipliers === nothing ? 1.0 : rate_multipliers[i]
         p_value = rate_p_values === nothing ? nothing : rate_p_values[i]
-        fluxes[i] = reaction_flux(reaction, Y, network.species_index, rho, T9; rate_multiplier=multiplier, rate_p_value=p_value)
+        fluxes[i] = _reaction_flux(network, reaction, network.compiled_reactions[i], Y, rho, T9; rate_multiplier=multiplier, rate_p_value=p_value, screening=screening)
     end
     return fluxes
 end
@@ -830,6 +1259,7 @@ function reaction_flux_history(
     T9;
     rate_multipliers=nothing,
     rate_p_values=nothing,
+    screening=nothing,
 )
     length(times) == size(history, 1) || throw(ArgumentError("times length must match the number of history rows"))
     size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
@@ -838,7 +1268,7 @@ function reaction_flux_history(
     for (n, t) in pairs(times)
         rho_t = _profile_value(rho, t)
         T9_t = _profile_value(T9, t)
-        flux_history[n, :] .= reaction_fluxes(network, view(history, n, :), rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+        flux_history[n, :] .= reaction_fluxes(network, view(history, n, :), rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
     end
     return flux_history
 end
@@ -878,20 +1308,22 @@ function species_flux_balance(
     T9::Real;
     rate_multipliers=nothing,
     rate_p_values=nothing,
+    screening=nothing,
 )
-    fluxes = reaction_fluxes(network, Y, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+    fluxes = reaction_fluxes(network, Y, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
     production = zeros(Float64, length(network.species))
     destruction = zeros(Float64, length(network.species))
 
     for (reaction_index, reaction) in pairs(network.reactions)
+        compiled = network.compiled_reactions[reaction_index]
         flux = fluxes[reaction_index]
 
-        for (name, count) in _species_counts(reaction.products)
-            production[_species_index(network.species_index, name)] += count * flux
+        for (index, count) in zip(compiled.product_species_indices, compiled.product_species_counts)
+            production[index] += count * flux
         end
 
-        for (name, count) in _species_counts(reaction.reactants)
-            destruction[_species_index(network.species_index, name)] += count * flux
+        for (index, count) in zip(compiled.reactant_species_indices, compiled.reactant_species_counts)
+            destruction[index] += count * flux
         end
     end
 
@@ -1092,23 +1524,148 @@ function _checked_initial_abundances(Y0::AbstractVector{<:Real}, network::Reacti
     return Float64.(Y0)
 end
 
-function _rhs_at(network::ReactionNetwork, Y::AbstractVector{<:Real}, rho, T9, t::Real; rate_multipliers=nothing, rate_p_values=nothing)
+function _rhs_at(network::ReactionNetwork, Y::AbstractVector{<:Real}, rho, T9, t::Real; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     rho_t = _profile_value(rho, t)
     T9_t = _profile_value(T9, t)
-    return network_rhs(Y, network, rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+    return network_rhs(Y, network, rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
 end
 
-function _euler_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing)
-    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+function _euler_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
+    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
     return Y .+ dt .* k1
 end
 
-function _rk4_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing)
-    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
-    k2 = _rhs_at(network, Y .+ 0.5 * dt .* k1, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
-    k3 = _rhs_at(network, Y .+ 0.5 * dt .* k2, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
-    k4 = _rhs_at(network, Y .+ dt .* k3, rho, T9, t + dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+function _rk4_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
+    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    k2 = _rhs_at(network, Y .+ 0.5 * dt .* k1, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    k3 = _rhs_at(network, Y .+ 0.5 * dt .* k2, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    k4 = _rhs_at(network, Y .+ dt .* k3, rho, T9, t + dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
     return Y .+ (dt / 6.0) .* (k1 .+ 2.0 .* k2 .+ 2.0 .* k3 .+ k4)
+end
+
+function _max_abs(values::AbstractVector{<:Real})
+    maximum(abs, values; init=0.0)
+end
+
+struct NewtonConvergenceError <: Exception
+    iterations::Int
+    residual_norm::Float64
+end
+
+function Base.showerror(io::IO, err::NewtonConvergenceError)
+    print(io, "backward Euler Newton iteration failed to converge after $(err.iterations) iterations; residual norm = $(err.residual_norm)")
+end
+
+function _backward_euler_residual(network::ReactionNetwork, Y_next::Vector{Float64}, Y::Vector{Float64}, t_next::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
+    return Y_next .- Y .- dt .* _rhs_at(network, Y_next, rho, T9, t_next; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+end
+
+function _backward_euler_jacobian(network::ReactionNetwork, Y_next::Vector{Float64}, residual::Vector{Float64}, Y::Vector{Float64}, t_next::Float64, dt::Float64, rho, T9, finite_difference_epsilon::Float64; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
+    n = length(Y_next)
+    jacobian = Matrix{Float64}(undef, n, n)
+    perturbed = copy(Y_next)
+
+    for j in 1:n
+        saved = perturbed[j]
+        step = finite_difference_epsilon * max(abs(saved), 1.0)
+        perturbed[j] = saved + step
+        perturbed_residual = _backward_euler_residual(network, perturbed, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        jacobian[:, j] .= (perturbed_residual .- residual) ./ step
+        perturbed[j] = saved
+    end
+
+    return jacobian
+end
+
+function _backward_euler_step(
+    network::ReactionNetwork,
+    Y::Vector{Float64},
+    t::Float64,
+    dt::Float64,
+    rho,
+    T9;
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    screening=nothing,
+    newton_tolerance::Real=1.0e-10,
+    max_newton_iterations::Integer=20,
+    finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    newton_iterations=nothing,
+)
+    max_newton_iterations > 0 || throw(ArgumentError("max_newton_iterations must be positive"))
+    newton_tolerance > 0.0 || throw(ArgumentError("newton_tolerance must be positive"))
+    finite_difference_epsilon > 0.0 || throw(ArgumentError("finite_difference_epsilon must be positive"))
+
+    t_next = t + dt
+    Y_next = _euler_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+
+    residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    tolerance = Float64(newton_tolerance) * max(_max_abs(Y_next), 1.0)
+    if _max_abs(residual) <= tolerance
+        newton_iterations !== nothing && push!(newton_iterations, 0)
+        return Y_next
+    end
+
+    for iteration in 1:max_newton_iterations
+        jacobian = _backward_euler_jacobian(
+            network,
+            Y_next,
+            residual,
+            Y,
+            t_next,
+            dt,
+            rho,
+            T9,
+            Float64(finite_difference_epsilon);
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
+            screening=screening,
+        )
+        correction = jacobian \ (-residual)
+        Y_next .+= correction
+
+        residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        tolerance = Float64(newton_tolerance) * max(_max_abs(Y_next), 1.0)
+        if _max_abs(residual) <= tolerance || _max_abs(correction) <= tolerance
+            newton_iterations !== nothing && push!(newton_iterations, iteration)
+            return Y_next
+        end
+    end
+
+    throw(NewtonConvergenceError(Int(max_newton_iterations), _max_abs(residual)))
+end
+
+function _newton_iteration_summary(iterations::Vector{Int}, failed_steps::Integer)
+    if isempty(iterations)
+        return (
+            newton_iterations=Int[],
+            mean_newton_iterations=NaN,
+            max_newton_iterations=0,
+            newton_failed_steps=Int(failed_steps),
+        )
+    end
+
+    return (
+        newton_iterations=copy(iterations),
+        mean_newton_iterations=sum(iterations) / length(iterations),
+        max_newton_iterations=maximum(iterations),
+        newton_failed_steps=Int(failed_steps),
+    )
+end
+
+function _fixed_solver_stats(times::AbstractVector{<:Real}, newton_iterations::Vector{Int}, newton_failed_steps::Integer)
+    step_sizes = diff(Float64.(times))
+    return (
+        accepted_steps=length(times) - 1,
+        rejected_steps=0,
+        min_dt=minimum(step_sizes),
+        max_dt=maximum(step_sizes),
+        final_dt=last(step_sizes),
+        max_fractional_change=NaN,
+        max_absolute_change=NaN,
+        reached_dt_min=false,
+        _newton_iteration_summary(newton_iterations, newton_failed_steps)...,
+    )
 end
 
 #=
@@ -1128,8 +1685,9 @@ Arguments:
 - `rho`: density in g cm^-3, or a function `rho(t)`.
 - `T9`: temperature in GK, or a function `T9(t)`.
 
-Supported methods are `:euler` and `:rk4`. RK4 is usually more accurate for the
-same timestep, while Euler is useful for simple debugging.
+Supported methods are `:euler`, `:rk4`, and `:backward_euler`. RK4 is usually
+more accurate for the same timestep, while backward Euler is a dependency-free
+implicit option for stiffer exploratory runs.
 
 Returns `(times, Y_history)`, where `Y_history[i, j]` is the abundance of species
 `network.species[j]` at `times[i]`.
@@ -1145,22 +1703,45 @@ function solve_network(
     rate_multipliers=nothing,
     rate_p_values=nothing,
     clamp_negative::Bool=true,
+    screening=nothing,
+    newton_tolerance::Real=1.0e-10,
+    max_newton_iterations::Integer=20,
+    finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    return_stats::Bool=false,
 )
     times = _time_grid(tspan, dt)
     Y = _checked_initial_abundances(Y0, network)
     Y_history = Matrix{Float64}(undef, length(times), length(Y))
     Y_history[1, :] .= Y
+    newton_iterations = Int[]
+    newton_failed_steps = 0
 
     for step_index in 1:(length(times)-1)
         t = times[step_index]
         step_dt = times[step_index+1] - t
 
         if method == :euler
-            Y = _euler_step(network, Y, t, step_dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+            Y = _euler_step(network, Y, t, step_dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
         elseif method == :rk4
-            Y = _rk4_step(network, Y, t, step_dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+            Y = _rk4_step(network, Y, t, step_dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        elseif method == :backward_euler
+            Y = _backward_euler_step(
+                network,
+                Y,
+                t,
+                step_dt,
+                rho,
+                T9;
+                rate_multipliers=rate_multipliers,
+                rate_p_values=rate_p_values,
+                screening=screening,
+                newton_tolerance=newton_tolerance,
+                max_newton_iterations=max_newton_iterations,
+                finite_difference_epsilon=finite_difference_epsilon,
+                newton_iterations=newton_iterations,
+            )
         else
-            throw(ArgumentError("unsupported method $method; use :euler or :rk4"))
+            throw(ArgumentError("unsupported method $method; use :euler, :rk4, or :backward_euler"))
         end
 
         if clamp_negative
@@ -1172,16 +1753,48 @@ function solve_network(
         Y_history[step_index+1, :] .= Y
     end
 
-    return times, Y_history
+    stats = _fixed_solver_stats(times, newton_iterations, newton_failed_steps)
+    return return_stats ? (times, Y_history, stats) : (times, Y_history)
 end
 
-function _single_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9, method::Symbol; rate_multipliers=nothing, rate_p_values=nothing)
+function _single_step(
+    network::ReactionNetwork,
+    Y::Vector{Float64},
+    t::Float64,
+    dt::Float64,
+    rho,
+    T9,
+    method::Symbol;
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    screening=nothing,
+    newton_tolerance::Real=1.0e-10,
+    max_newton_iterations::Integer=20,
+    finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    newton_iterations=nothing,
+)
     if method == :euler
-        return _euler_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+        return _euler_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
     elseif method == :rk4
-        return _rk4_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+        return _rk4_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    elseif method == :backward_euler
+        return _backward_euler_step(
+            network,
+            Y,
+            t,
+            dt,
+            rho,
+            T9;
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
+            screening=screening,
+            newton_tolerance=newton_tolerance,
+            max_newton_iterations=max_newton_iterations,
+            finite_difference_epsilon=finite_difference_epsilon,
+            newton_iterations=newton_iterations,
+        )
     end
-    throw(ArgumentError("unsupported method $method; use :euler or :rk4"))
+    throw(ArgumentError("unsupported method $method; use :euler, :rk4, or :backward_euler"))
 end
 
 function _max_fractional_change(Y::Vector{Float64}, Y_next::Vector{Float64}, abundance_floor::Float64)
@@ -1193,13 +1806,41 @@ function _max_fractional_change(Y::Vector{Float64}, Y_next::Vector{Float64}, abu
     return max_change
 end
 
+function _max_absolute_change(Y::Vector{Float64}, Y_next::Vector{Float64})
+    max_change = 0.0
+    for i in eachindex(Y)
+        max_change = max(max_change, abs(Y_next[i] - Y[i]))
+    end
+    return max_change
+end
+
+function _adaptive_factor(
+    fractional_change::Float64,
+    max_fractional_change::Float64,
+    absolute_change::Float64,
+    max_absolute_change::Float64,
+    safety::Float64,
+    shrink_factor::Float64,
+    growth_factor::Float64,
+)
+    factor = growth_factor
+    if fractional_change > 0.0
+        factor = min(factor, safety * max_fractional_change / fractional_change)
+    end
+    if isfinite(max_absolute_change) && absolute_change > 0.0
+        factor = min(factor, safety * max_absolute_change / absolute_change)
+    end
+    return clamp(factor, shrink_factor, growth_factor)
+end
+
 #=
     solve_network_adaptive(network, Y0, tspan, dt_initial, rho, T9; ...)
 
 Evolve a network with simple adaptive explicit timestepping. A proposed step is
 accepted when the maximum fractional abundance change is below
 `max_fractional_change`, using `abundance_floor` to avoid division by zero for
-trace species.
+trace species. If `max_absolute_change` is finite, the step must also satisfy
+that absolute abundance-change limit.
 
 This is still an explicit method, not a stiff implicit solver, but it is safer
 than a fixed timestep for exploratory post-processing.
@@ -1213,6 +1854,7 @@ function solve_network_adaptive(
     T9;
     method::Symbol=:rk4,
     max_fractional_change::Real=0.05,
+    max_absolute_change::Real=Inf,
     abundance_floor::Real=1.0e-30,
     dt_min::Real=1.0e-12,
     dt_max::Real=Inf,
@@ -1223,12 +1865,18 @@ function solve_network_adaptive(
     rate_multipliers=nothing,
     rate_p_values=nothing,
     clamp_negative::Bool=true,
+    screening=nothing,
+    return_stats::Bool=false,
+    newton_tolerance::Real=1.0e-10,
+    max_newton_iterations::Integer=20,
+    finite_difference_epsilon::Real=sqrt(eps(Float64)),
 )
     t_start = Float64(tspan[1])
     t_end = Float64(tspan[2])
     dt = min(Float64(dt_initial), Float64(dt_max))
     _validate_time_inputs(t_start, t_end, dt)
     max_fractional_change > 0.0 || throw(ArgumentError("max_fractional_change must be positive"))
+    max_absolute_change > 0.0 || throw(ArgumentError("max_absolute_change must be positive"))
     abundance_floor > 0.0 || throw(ArgumentError("abundance_floor must be positive"))
     dt_min > 0.0 || throw(ArgumentError("dt_min must be positive"))
     dt_max > 0.0 || throw(ArgumentError("dt_max must be positive"))
@@ -1242,10 +1890,46 @@ function solve_network_adaptive(
     history_rows = Vector{Float64}[copy(Y)]
     t = t_start
     accepted_steps = 0
+    rejected_steps = 0
+    min_dt_used = Inf
+    max_dt_used = 0.0
+    max_fractional_change_seen = 0.0
+    max_absolute_change_seen = 0.0
+    reached_dt_min = false
+    newton_iterations = Int[]
+    newton_failed_steps = 0
 
     while t < t_end && accepted_steps < max_steps
         step_dt = min(dt, t_end - t)
-        Y_next = _single_step(network, Y, t, step_dt, rho, T9, method; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values)
+        proposed_newton_iterations = Int[]
+        Y_next = try
+            _single_step(
+                network,
+                Y,
+                t,
+                step_dt,
+                rho,
+                T9,
+                method;
+                rate_multipliers=rate_multipliers,
+                rate_p_values=rate_p_values,
+                screening=screening,
+                newton_tolerance=newton_tolerance,
+                max_newton_iterations=max_newton_iterations,
+                finite_difference_epsilon=finite_difference_epsilon,
+                newton_iterations=proposed_newton_iterations,
+            )
+        catch err
+            if err isa NewtonConvergenceError
+                rejected_steps += 1
+                newton_failed_steps += 1
+                at_dt_min = step_dt <= dt_min
+                at_dt_min && throw(ArgumentError("backward Euler Newton iteration failed at dt_min=$dt_min: $err"))
+                dt = max(step_dt * shrink_factor, Float64(dt_min))
+                continue
+            end
+            rethrow()
+        end
 
         if clamp_negative
             for i in eachindex(Y_next)
@@ -1253,24 +1937,44 @@ function solve_network_adaptive(
             end
         end
 
-        change = _max_fractional_change(Y, Y_next, Float64(abundance_floor))
-        if change <= max_fractional_change || step_dt <= dt_min
+        fractional_change = _max_fractional_change(Y, Y_next, Float64(abundance_floor))
+        absolute_change = _max_absolute_change(Y, Y_next)
+        max_fractional_change_seen = max(max_fractional_change_seen, fractional_change)
+        max_absolute_change_seen = max(max_absolute_change_seen, absolute_change)
+
+        fractional_ok = fractional_change <= max_fractional_change
+        absolute_ok = absolute_change <= max_absolute_change
+        at_dt_min = step_dt <= dt_min
+        if (fractional_ok && absolute_ok) || at_dt_min
             t += step_dt
             Y = Y_next
             push!(times, t)
             push!(history_rows, copy(Y))
+            append!(newton_iterations, proposed_newton_iterations)
             accepted_steps += 1
+            min_dt_used = min(min_dt_used, step_dt)
+            max_dt_used = max(max_dt_used, step_dt)
+            reached_dt_min |= at_dt_min
 
-            if change == 0.0
+            if fractional_change == 0.0 && absolute_change == 0.0
                 dt = min(step_dt * growth_factor, Float64(dt_max))
             else
-                factor = clamp(safety * max_fractional_change / change, shrink_factor, growth_factor)
+                factor = _adaptive_factor(
+                    fractional_change,
+                    Float64(max_fractional_change),
+                    absolute_change,
+                    Float64(max_absolute_change),
+                    Float64(safety),
+                    Float64(shrink_factor),
+                    Float64(growth_factor),
+                )
                 dt = min(max(step_dt * factor, Float64(dt_min)), Float64(dt_max))
             end
         else
+            rejected_steps += 1
             dt = max(step_dt * shrink_factor, Float64(dt_min))
-            if step_dt <= dt_min
-                throw(ArgumentError("adaptive timestep reached dt_min=$dt_min but fractional change=$change exceeds limit=$max_fractional_change"))
+            if at_dt_min
+                throw(ArgumentError("adaptive timestep reached dt_min=$dt_min but proposed fractional change=$fractional_change and absolute change=$absolute_change exceed limits"))
             end
         end
     end
@@ -1282,7 +1986,19 @@ function solve_network_adaptive(
         history[i, :] .= row
     end
 
-    return times, history
+    stats = (
+        accepted_steps=accepted_steps,
+        rejected_steps=rejected_steps,
+        min_dt=min_dt_used,
+        max_dt=max_dt_used,
+        final_dt=dt,
+        max_fractional_change=max_fractional_change_seen,
+        max_absolute_change=max_absolute_change_seen,
+        reached_dt_min=reached_dt_min,
+        _newton_iteration_summary(newton_iterations, newton_failed_steps)...,
+    )
+
+    return return_stats ? (times, history, stats) : (times, history)
 end
 
 #=
@@ -1310,6 +2026,7 @@ function run_monte_carlo(
     rate_multipliers=nothing,
     clamp_negative::Bool=true,
     store_histories::Bool=false,
+    screening=nothing,
 )
     nruns > 0 || throw(ArgumentError("nruns must be positive"))
 
@@ -1334,6 +2051,7 @@ function run_monte_carlo(
             rate_multipliers=rate_multipliers,
             rate_p_values=p_values,
             clamp_negative=clamp_negative,
+            screening=screening,
         )
 
         if run_index == 1
@@ -1351,6 +2069,137 @@ function run_monte_carlo(
         histories=histories,
         species=copy(network.species),
         reactions=[reaction_string(reaction) for reaction in network.reactions],
+    )
+end
+
+#=
+    solve_single_zone(tables, labels, X0, tspan, dt, rho, T9; adaptive=true, ...)
+
+Build and run a single-zone post-processing network from user-facing inputs.
+
+This is the convenience workflow for interactive use:
+- select STARLIB reactions by label
+- infer and validate the network
+- convert initial mass fractions `X0` to abundances
+- run fixed-step or adaptive integration
+- return mass-fraction diagnostics with the raw abundance history
+=#
+function solve_single_zone(
+    tables::AbstractVector{ReactionRateTable},
+    labels::AbstractVector{<:AbstractString},
+    X0::AbstractDict,
+    tspan::Tuple{<:Real,<:Real},
+    dt::Real,
+    rho,
+    T9;
+    species=nothing,
+    source=nothing,
+    on_multiple::Symbol=:error,
+    adaptive::Bool=true,
+    method::Symbol=:rk4,
+    normalize_mass_fractions::Bool=false,
+    check_mass_fraction_sum::Bool=false,
+    mass_fraction_atol::Real=1.0e-8,
+    validate::Bool=true,
+    max_fractional_change::Real=0.05,
+    max_absolute_change::Real=Inf,
+    abundance_floor::Real=1.0e-30,
+    dt_min::Real=1.0e-12,
+    dt_max::Real=Inf,
+    safety::Real=0.8,
+    growth_factor::Real=2.0,
+    shrink_factor::Real=0.5,
+    max_steps::Integer=1_000_000,
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    clamp_negative::Bool=true,
+    screening=nothing,
+    newton_tolerance::Real=1.0e-10,
+    max_newton_iterations::Integer=20,
+    finite_difference_epsilon::Real=sqrt(eps(Float64)),
+)
+    network = network_from_labels(tables, labels; species=species, source=source, on_multiple=on_multiple)
+    validation = validate ? network_validation_report(network; throw_on_error=true) : network_validation_report(network)
+    Y0 = abundances_from_mass_fractions(
+        network,
+        X0;
+        normalize=normalize_mass_fractions,
+        check_sum=check_mass_fraction_sum,
+        atol=mass_fraction_atol,
+    )
+
+    times, history, solver_stats = if adaptive
+        solve_network_adaptive(
+            network,
+            Y0,
+            tspan,
+            dt,
+            rho,
+            T9;
+            method=method,
+            max_fractional_change=max_fractional_change,
+            max_absolute_change=max_absolute_change,
+            abundance_floor=abundance_floor,
+            dt_min=dt_min,
+            dt_max=dt_max,
+            safety=safety,
+            growth_factor=growth_factor,
+            shrink_factor=shrink_factor,
+            max_steps=max_steps,
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
+            clamp_negative=clamp_negative,
+            screening=screening,
+            return_stats=true,
+            newton_tolerance=newton_tolerance,
+            max_newton_iterations=max_newton_iterations,
+            finite_difference_epsilon=finite_difference_epsilon,
+        )
+    else
+        solve_network(
+            network,
+            Y0,
+            tspan,
+            dt,
+            rho,
+            T9;
+            method=method,
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
+            clamp_negative=clamp_negative,
+            screening=screening,
+            newton_tolerance=newton_tolerance,
+            max_newton_iterations=max_newton_iterations,
+            finite_difference_epsilon=finite_difference_epsilon,
+            return_stats=true,
+        )
+    end
+
+    flux_history = reaction_flux_history(
+        network,
+        history,
+        times,
+        rho,
+        T9;
+        rate_multipliers=rate_multipliers,
+        rate_p_values=rate_p_values,
+        screening=screening,
+    )
+
+    return (
+        network=network,
+        validation=validation,
+        times=times,
+        abundances=history,
+        mass_fraction_history=mass_fraction_history(network, history),
+        mass_fraction_drift=mass_fraction_drift(network, history),
+        abundance_diagnostics=abundance_diagnostics(network, history),
+        initial_mass_fractions=mass_fractions_from_abundances(network, view(history, 1, :)),
+        final_mass_fractions=mass_fractions_from_abundances(network, view(history, size(history, 1), :)),
+        reaction_fluxes=flux_history,
+        integrated_fluxes=integrated_fluxes(times, flux_history),
+        solver_stats=solver_stats,
+        adaptive=adaptive,
     )
 end
 
