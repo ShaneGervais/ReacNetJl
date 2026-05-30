@@ -133,6 +133,8 @@ times, history, solver_stats = solve_network_adaptive(
 
 flux_history = reaction_flux_history(network, history, times, profiles.rho, profiles.T9; screening=screening_model)
 total_fluxes = integrated_fluxes(times, flux_history)
+energy_history = energy_generation_history(network, history, times, profiles.rho, profiles.T9; screening=screening_model)
+total_energy = integrated_energy_generation(times, energy_history)
 initial_X = mass_fractions_from_abundances(network, history[1, :])
 final_X = mass_fractions_from_abundances(network, history[end, :])
 mass_drift = mass_fraction_drift(network, history)
@@ -150,6 +152,8 @@ println("Newton iterations mean/max = ", solver_stats.mean_newton_iterations, " 
 println("Newton failed steps = ", solver_stats.newton_failed_steps)
 println("time = ", first(times), " to ", last(times), " s")
 println("total mass fraction = ", mass_drift.initial, " to ", mass_drift.final)
+println("peak epsilon_nuc = ", maximum(energy_history), " erg g^-1 s^-1")
+println("integrated nuclear energy = ", total_energy, " erg g^-1")
 if mass_drift.max_abs_drift > 1.0e-3
     println("WARNING: total mass-fraction drift exceeded 1.0e-3; treat this run as numerically suspect.")
 end

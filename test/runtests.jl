@@ -355,6 +355,15 @@ end
     @test_throws ArgumentError integrated_fluxes([0.0], [1.0 2.0])
     @test_throws ArgumentError integrated_fluxes([0.0, -1.0], reshape([1.0, 2.0], 2, 1))
 
+    epsilon = energy_generation_rate(network, Y0, 1000.0, 0.5)
+    @test epsilon ≈ reaction.rate_table.q_value * fluxes[1] * ReacNetJl.AVOGADRO * ReacNetJl.MEV_TO_ERG
+    epsilon_history = energy_generation_history(network, history, times, 1000.0, 0.5)
+    @test length(epsilon_history) == length(times)
+    @test epsilon_history[1] ≈ energy_generation_rate(network, history[1, :], 1000.0, 0.5)
+    @test integrated_energy_generation([0.0, 2.0], [1.0, 3.0]) ≈ 4.0
+    @test_throws ArgumentError energy_generation_history(network, history, times[1:end-1], 1000.0, 0.5)
+    @test_throws ArgumentError integrated_energy_generation([0.0], [1.0])
+
     _, boosted_history = solve_network(network, Y0, (0.0, 1.0e-3), 1.0e-4, 1000.0, 0.5; method=:rk4, rate_multipliers=[2.0])
     @test boosted_history[end, network.species_index["f18"]] < history[end, network.species_index["f18"]]
 
@@ -551,6 +560,8 @@ end
     @test result.mass_fraction_drift.initial ≈ total_mass_fraction(result.network, result.abundances[1, :])
     @test !result.abundance_diagnostics.has_negative_abundance
     @test result.solver_stats.accepted_steps == length(result.times) - 1
+    @test length(result.energy_generation) == length(result.times)
+    @test isfinite(result.integrated_energy_generation)
 
     unsupported_path = tempname()
     open(unsupported_path, "w") do io

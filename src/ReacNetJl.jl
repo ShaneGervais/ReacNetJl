@@ -37,6 +37,9 @@ export Species,
     reaction_fluxes,
     reaction_flux_history,
     integrated_fluxes,
+    energy_generation_rate,
+    energy_generation_history,
+    integrated_energy_generation,
     species_flux_balance,
     reaction_edges,
     reaction_conservation,
@@ -161,6 +164,8 @@ end
 
 const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib_v610_120222.dat/starlib.dat")
 const STARLIB_ROWS_PER_REACTION = 60
+const AVOGADRO = 6.02214076e23
+const MEV_TO_ERG = 1.602176634e-6
 
 const _PARTICLE_ALIASES = Dict(
     "p" => "p",
@@ -1293,6 +1298,77 @@ function integrated_fluxes(times::AbstractVector{<:Real}, flux_history::Abstract
 end
 
 #=
+    energy_generation_rate(network, Y, rho, T9; ...)
+
+Return diagnostic nuclear energy generation in erg g^-1 s^-1 from reaction
+Q-values and instantaneous reaction fluxes. This does not feed back into the
+temperature trajectory.
+=#
+function energy_generation_rate(
+    network::ReactionNetwork,
+    Y::AbstractVector{<:Real},
+    rho::Real,
+    T9::Real;
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    screening=nothing,
+)
+    fluxes = reaction_fluxes(network, Y, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    epsilon = 0.0
+    for (i, reaction) in pairs(network.reactions)
+        epsilon += reaction.rate_table.q_value * fluxes[i]
+    end
+    return epsilon * AVOGADRO * MEV_TO_ERG
+end
+
+#=
+    energy_generation_history(network, history, times, rho, T9; ...)
+
+Return diagnostic nuclear energy generation in erg g^-1 s^-1 at every saved
+history row.
+=#
+function energy_generation_history(
+    network::ReactionNetwork,
+    history::AbstractMatrix{<:Real},
+    times::AbstractVector{<:Real},
+    rho,
+    T9;
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    screening=nothing,
+)
+    length(times) == size(history, 1) || throw(ArgumentError("times length must match the number of history rows"))
+    size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
+
+    epsilon = Vector{Float64}(undef, length(times))
+    for (n, t) in pairs(times)
+        rho_t = _profile_value(rho, t)
+        T9_t = _profile_value(T9, t)
+        epsilon[n] = energy_generation_rate(network, view(history, n, :), rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    end
+    return epsilon
+end
+
+#=
+    integrated_energy_generation(times, epsilon_history)
+
+Integrate diagnostic energy generation in time using the trapezoid rule.
+Returns specific energy release in erg g^-1.
+=#
+function integrated_energy_generation(times::AbstractVector{<:Real}, epsilon_history::AbstractVector{<:Real})
+    length(times) == length(epsilon_history) || throw(ArgumentError("times length must match energy-history length"))
+    length(times) >= 2 || throw(ArgumentError("at least two time points are required"))
+
+    total = 0.0
+    for n in 1:(length(times)-1)
+        dt = Float64(times[n+1] - times[n])
+        dt >= 0.0 || throw(ArgumentError("times must be monotonically increasing"))
+        total += 0.5 * dt * (epsilon_history[n] + epsilon_history[n+1])
+    end
+    return total
+end
+
+#=
     species_flux_balance(network, Y, rho, T9; rate_multipliers=nothing)
 
 Calculate instantaneous production, destruction, and net `dY/dt` contributions
@@ -2185,6 +2261,16 @@ function solve_single_zone(
         rate_p_values=rate_p_values,
         screening=screening,
     )
+    epsilon_history = energy_generation_history(
+        network,
+        history,
+        times,
+        rho,
+        T9;
+        rate_multipliers=rate_multipliers,
+        rate_p_values=rate_p_values,
+        screening=screening,
+    )
 
     return (
         network=network,
@@ -2198,6 +2284,8 @@ function solve_single_zone(
         final_mass_fractions=mass_fractions_from_abundances(network, view(history, size(history, 1), :)),
         reaction_fluxes=flux_history,
         integrated_fluxes=integrated_fluxes(times, flux_history),
+        energy_generation=epsilon_history,
+        integrated_energy_generation=integrated_energy_generation(times, epsilon_history),
         solver_stats=solver_stats,
         adaptive=adaptive,
     )

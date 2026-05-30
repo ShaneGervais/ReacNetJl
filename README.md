@@ -38,6 +38,7 @@ Implemented so far:
 - trajectory file reading and interpolation
 - metadata-aware trajectory input with `AGEUNIT`, `TUNIT`, and `RHOUNIT`
 - flux diagnostics and integrated reaction flows
+- diagnostic nuclear energy generation from Q-values
 - total mass-fraction history and drift diagnostics
 - abundance positivity diagnostics
 - approximate weak charged-particle screening multiplier via `screening=:weak`
@@ -76,6 +77,7 @@ result = solve_single_zone(
 
 println(result.final_mass_fractions)
 println(result.integrated_fluxes)
+println(result.integrated_energy_generation)
 println(result.mass_fraction_drift)
 println(result.abundance_diagnostics)
 println(result.solver_stats)
@@ -85,6 +87,27 @@ This builds the network from STARLIB labels, validates reaction bookkeeping,
 converts mass fractions to abundances, evolves the one-zone ODE, and returns
 raw abundance histories, mass-fraction diagnostics, positivity diagnostics, and
 solver statistics.
+
+## Single-Zone PPN Scope
+
+The current target is standard single-zone post-processing nucleosynthesis
+(PPN). In this mode ReacNetJl takes prescribed thermodynamic histories:
+
+```text
+T9(t), rho(t), initial composition -> network solve -> abundances and diagnostics
+```
+
+The network does not change the trajectory temperature or density. Energy
+generation is diagnostic only:
+
+```text
+epsilon_nuc(t) = N_A * MeV_to_erg * sum_r Q_r F_r(t)
+```
+
+This is the right scope for validating rates, reaction flow, abundance output,
+screening choices, and STARLIB uncertainty propagation against a given nova
+trajectory. Convection, mixing between zones, and hydrodynamic feedback belong
+to later MPPN/TPPN stages, not the current single-zone PPN core.
 
 ## Current Simulation Example
 
@@ -105,6 +128,7 @@ species = 52
 screening = weak
 total mass fraction = 1.0 to about 1.0
 Newton failed steps = 0
+peak epsilon_nuc and integrated nuclear energy are printed as diagnostics
 ```
 
 This is now a real trajectory-driven post-processing calculation if
@@ -129,10 +153,10 @@ Not implemented yet:
   should not fake it from Q-values alone.
 - Strong/intermediate screening regimes. The current `screening=:weak` option
   is an approximate Salpeter-style weak-screening multiplier.
-- Energy feedback coupling. Since post-processing follows prescribed
-  `T9(t), rho(t)`, energy release cannot change the temperature unless we add a
-  one-zone thermal equation such as `dT/dt = (epsilon_nuc - losses) / c_P`
-  with an equation of state, heat capacity, and expansion/cooling model.
+- Energy feedback coupling. This is intentionally out of scope for standard
+  single-zone PPN. It would require a separate self-heating one-zone mode with
+  `dT/dt = (epsilon_nuc - losses) / c_P`, an equation of state, heat capacity,
+  and an expansion/cooling model.
 
 ## Core equations
 
@@ -483,12 +507,12 @@ The first STARLIB uncertainty propagation layer is now complete:
 
 Recommended next implementation order:
 
-1. Add energy-generation diagnostics from reaction Q-values.
-2. Add optional CSV output for examples and Monte Carlo summaries.
-3. Add a one-zone thermal feedback mode with a simple EOS/heat-capacity model.
+1. Add `initial_abundance.DAT` parsing and use it in the mini nova example.
+2. Add optional CSV output for abundance, flux, and energy diagnostics.
+3. Verify the expanded network against the STARLIB rates needed for the target nova regime.
 4. Add reciprocal-rule reverse rates with partition-function support.
 5. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
-6. Improve unsupported STARLIB chapter parsing beyond reporting.
+6. Design the MPPN stage: multiple zones, zone masses, and mixing coefficients.
 
 ## Learning path
 
