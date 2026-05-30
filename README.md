@@ -50,6 +50,7 @@ Implemented so far:
 - precomputed integer stoichiometry inside `ReactionNetwork`
 - adaptive solver diagnostics for accepted/rejected steps, timestep range, and Newton iterations
 - one-call single-zone post-processing from reaction labels and mass fractions
+- full trajectory-indexed PPN abundance output as `iso_massfXXXXX.DAT` files plus a wide mass-fraction CSV
 - tests for parsing, interpolation, fluxes, RHS calculation, time evolution, and user-facing workflows
 
 ## Quick single-zone workflow
@@ -143,6 +144,44 @@ This is now a real trajectory-driven post-processing calculation if
 `trajectory.input` is present, but it is still not a production nova model until
 the network, screening model, reverse rates, and energy feedback are validated
 for the target nova regime.
+
+## Full Single-Zone PPN Output
+
+`examples/single_zone_nova_ppn.jl` is the current user-facing single-zone PPN
+output driver. It reads:
+
+- `trajectory.input` from the project root
+- `initial_abundance.DAT` or `initial_abundance.dat` from the project root
+- `iso_massf00804.DAT` as an optional output-format template when present
+
+Run it with:
+
+```sh
+julia --project=. examples/single_zone_nova_ppn.jl
+```
+
+The script solves the active 97-reaction nova network with backward Euler and
+weak screening, then interpolates the abundance history onto the trajectory time
+grid. For the current 805-row trajectory it writes:
+
+```text
+outputs/single_zone_nova_ppn/iso_massf00000.DAT
+...
+outputs/single_zone_nova_ppn/iso_massf00804.DAT
+outputs/single_zone_nova_ppn/mass_fractions.csv
+```
+
+The `.DAT` files use mass fractions under the `ABUNDANCE_MF` column and carry
+diagnostic header values for timestep, age, `T9`, `rho`, number-density markers,
+and nuclear energy generation. Isotopes outside the active reaction network are
+kept at their normalized initial mass fractions; active-network isotopes are
+evolved by the solver. The generated `outputs/` directory is ignored by Git.
+
+For a quick formatting check without writing every trajectory state:
+
+```sh
+NOVA_PPN_OUTPUT_STRIDE=100 julia --project=. examples/single_zone_nova_ppn.jl
+```
 
 ## Physics Roadmap
 
@@ -447,6 +486,21 @@ trajectory file -> T9(t), rho(t) -> solve_network
 
 ---
 
+### Milestone 9b: Full PPN abundance output — done
+
+Goal: write trajectory-indexed abundance output for the single-zone PPN workflow.
+
+Implemented in `examples/single_zone_nova_ppn.jl`:
+
+- root-level `trajectory.input` and `initial_abundance.DAT`/`.dat` discovery
+- expanded nova network solve over the full trajectory
+- interpolation from internal solver states onto trajectory output states
+- `iso_massfXXXXX.DAT` mass-fraction files with template-like headers
+- wide `mass_fractions.csv` with one row per written trajectory state
+- inert/outside-network isotope carry-through from the initial abundance file
+
+---
+
 ### Milestone 10: Stiff solver research and implementation
 
 Goal: move toward production-quality integration. The first dependency-free
@@ -515,11 +569,11 @@ The first STARLIB uncertainty propagation layer is now complete:
 
 Recommended next implementation order:
 
-1. Add optional CSV output for abundance, flux, and energy diagnostics.
-2. Verify the expanded network against the STARLIB rates needed for the target nova regime.
+1. Verify the expanded network against the STARLIB rates needed for the target nova regime.
+2. Add a network coverage report for active, inert, missing, and template-only isotopes.
 3. Add reciprocal-rule reverse rates with partition-function support.
 4. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
-5. Add a network coverage report for initial abundances outside the active network.
+5. Add optional flux-history and energy-history CSV outputs beside the mass-fraction CSV.
 6. Design the MPPN stage: multiple zones, zone masses, and mixing coefficients.
 
 ## Learning path
