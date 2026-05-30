@@ -15,6 +15,7 @@ export Species,
     parse_reaction_label,
     read_starlib,
     read_trajectory,
+    read_initial_abundances,
     trajectory_profiles,
     starlib_chapter_report,
     find_rate,
@@ -679,6 +680,50 @@ function read_trajectory(path::AbstractString)
 
     _validate_trajectory(time, T9, rho)
     return Trajectory(time, T9, rho)
+end
+
+function _parse_initial_abundance_species(fields::Vector{SubString{String}}, raw_line::AbstractString)
+    if length(fields) == 3 && uppercase(fields[2]) == "PROT"
+        return "p", parse(Float64, fields[3])
+    elseif length(fields) == 4
+        return normalize_species_name(string(fields[2], fields[3])), parse(Float64, fields[4])
+    elseif length(fields) == 3
+        return normalize_species_name(fields[2]), parse(Float64, fields[3])
+    end
+
+    throw(ArgumentError("initial abundance row must look like `Z sym A X`, `Z symA X`, or `1 PROT X`: $raw_line"))
+end
+
+#=
+    read_initial_abundances(path; normalize=false)
+
+Read an initial-abundance mass-fraction file with rows such as:
+
+    1 PROT  3.5e-1
+    6 c 12  1.0e-2
+    26 fe56 6.0e-4
+
+Returns a dictionary keyed by normalized species name. If `normalize=true`, all
+mass fractions are divided by the file total.
+=#
+function read_initial_abundances(path::AbstractString; normalize::Bool=false)
+    X = Dict{String,Float64}()
+
+    open(path, "r") do io
+        for raw_line in eachline(io)
+            line = strip(split(raw_line, '#'; limit=2)[1])
+            isempty(line) && continue
+            fields = split(line)
+            name, value = _parse_initial_abundance_species(fields, raw_line)
+            haskey(X, name) && throw(ArgumentError("duplicate initial abundance entry for species '$name'"))
+            X[name] = value
+        end
+    end
+
+    normalize || return X
+    total = sum(values(X); init=0.0)
+    total > 0.0 || throw(ArgumentError("cannot normalize initial abundances with non-positive total"))
+    return Dict(name => value / total for (name, value) in X)
 end
 
 function _linear_profile(x::Vector{Float64}, y::Vector{Float64}, value::Real)

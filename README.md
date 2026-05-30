@@ -37,6 +37,7 @@ Implemented so far:
 - Monte Carlo uncertainty runs
 - trajectory file reading and interpolation
 - metadata-aware trajectory input with `AGEUNIT`, `TUNIT`, and `RHOUNIT`
+- initial abundance table parsing via `read_initial_abundances`
 - flux diagnostics and integrated reaction flows
 - diagnostic nuclear energy generation from Q-values
 - total mass-fraction history and drift diagnostics
@@ -118,15 +119,22 @@ root when present. The file is parsed with:
 - `TUNIT = T9K`
 - `RHOUNIT = CGS`
 
-The current mini nova example uses a 63-reaction, 52-species network over CNO,
-NeNa, MgAl, a Si-Ca extension, and explicit `26Al*` isomer channels. It runs
-with backward Euler and weak screening:
+The current mini nova example uses `initial_abundance.dat` or
+`initial_abundance.DAT` from the project root when present. The abundance file
+is normalized before use, then species outside the active network are reported
+as inert/outside-network mass.
+
+The current mini nova example uses a 97-reaction, 88-active-species network over
+CNO, NeNa, MgAl, Si-Ca, and a Ca-Fe/Ni seed extension, with explicit `26Al*`
+isomer channels. It runs with backward Euler and weak screening:
 
 ```text
-validated reactions = 63
-species = 52
+validated reactions = 97
+species = 88
 screening = weak
-total mass fraction = 1.0 to about 1.0
+active network initial mass ≈ 0.99995
+inert/outside-network initial mass ≈ 4.6e-5
+total active-network mass is conserved
 Newton failed steps = 0
 peak epsilon_nuc and integrated nuclear energy are printed as diagnostics
 ```
@@ -507,11 +515,11 @@ The first STARLIB uncertainty propagation layer is now complete:
 
 Recommended next implementation order:
 
-1. Add `initial_abundance.DAT` parsing and use it in the mini nova example.
-2. Add optional CSV output for abundance, flux, and energy diagnostics.
-3. Verify the expanded network against the STARLIB rates needed for the target nova regime.
-4. Add reciprocal-rule reverse rates with partition-function support.
-5. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
+1. Add optional CSV output for abundance, flux, and energy diagnostics.
+2. Verify the expanded network against the STARLIB rates needed for the target nova regime.
+3. Add reciprocal-rule reverse rates with partition-function support.
+4. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
+5. Add a network coverage report for initial abundances outside the active network.
 6. Design the MPPN stage: multiple zones, zone masses, and mixing coefficients.
 
 ## Learning path

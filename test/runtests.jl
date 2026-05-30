@@ -71,6 +71,20 @@ end
     @test metadata_trajectory.T9 == [0.1, 0.2]
     @test metadata_trajectory.rho == [1.0e3, 1.0e4]
 
+    abundance_path = tempname()
+    open(abundance_path, "w") do io
+        println(io, "1 PROT 7.0e-1")
+        println(io, "2 he 4 2.8e-1")
+        println(io, "26 fe56 2.0e-2")
+    end
+    X = read_initial_abundances(abundance_path)
+    X_norm = read_initial_abundances(abundance_path; normalize=true)
+    rm(abundance_path; force=true)
+    @test X["p"] == 0.7
+    @test X["he4"] == 0.28
+    @test X["fe56"] == 0.02
+    @test sum(values(X_norm)) ≈ 1.0
+
     bad_path = tempname()
     open(bad_path, "w") do io
         println(io, "0.0 0.1 1000")

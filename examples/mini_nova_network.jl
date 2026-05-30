@@ -83,6 +83,42 @@ labels = [
     "38K(β+)38Ar",
     "38Ar(p,γ)39K",
     "39K(p,γ)40Ca",
+
+    # Ca-Fe/Ni seed extension
+    "40Ca(p,γ)41Sc",
+    "41Sc(β+)41Ca",
+    "41Ca(p,γ)42Sc",
+    "42Ca(p,γ)43Sc",
+    "42Sc(β+)42Ca",
+    "43Sc(β+)43Ca",
+    "43Ca(p,γ)44Sc",
+    "44Ca(p,γ)45Sc",
+    "44Sc(β+)44Ca",
+    "45Sc(p,γ)46Ti",
+    "45Sc(p,α)42Ca",
+    "46Ti(p,γ)47V",
+    "47V(β+)47Ti",
+    "47Ti(p,γ)48V",
+    "48Ti(p,γ)49V",
+    "48V(β+)48Ti",
+    "49V(β+)49Ti",
+    "49Ti(p,γ)50V",
+    "50Ti(p,γ)51V",
+    "50V(p,γ)51Cr",
+    "51V(p,γ)52Cr",
+    "51Cr(β+)51V",
+    "52Cr(p,γ)53Mn",
+    "53Mn(p,γ)54Fe",
+    "53Mn(β+)53Cr",
+    "54Fe(p,γ)55Co",
+    "55Co(β+)55Fe",
+    "55Mn(p,γ)56Fe",
+    "56Fe(p,γ)57Co",
+    "57Co(β+)57Fe",
+    "57Fe(p,γ)58Co",
+    "58Ni(p,γ)59Cu",
+    "59Cu(β+)59Ni",
+    "59Co(p,γ)60Ni",
 ]
 
 tables = read_starlib()
@@ -100,19 +136,37 @@ dt_max = trajectory_duration > 100.0 ? 20.0 : 0.05
 convergence_dt_limits = trajectory_duration > 100.0 ? (20.0, 10.0, 5.0) : (0.05, 0.025, 0.01)
 screening_model = :weak
 
-X0 = Dict(
-    "p" => 0.55,
-    "he4" => 0.33,
-    "12C" => 0.025,
-    "14N" => 0.010,
-    "16O" => 0.035,
-    "20Ne" => 0.030,
-    "22Ne" => 0.010,
-    "24Mg" => 0.007,
-    "25Mg" => 0.002,
-    "26Mg" => 0.001,
-)
-Y0 = abundances_from_mass_fractions(network, X0; check_sum=true, atol=1.0e-12)
+project_abundance_paths = [
+    joinpath(dirname(@__DIR__), "initial_abundance.DAT"),
+    joinpath(dirname(@__DIR__), "initial_abundance.dat"),
+]
+abundance_path = something(findfirst(isfile, project_abundance_paths), nothing)
+if abundance_path === nothing
+    X_file = Dict(
+        "p" => 0.55,
+        "he4" => 0.33,
+        "12C" => 0.025,
+        "14N" => 0.010,
+        "16O" => 0.035,
+        "20Ne" => 0.030,
+        "22Ne" => 0.010,
+        "24Mg" => 0.007,
+        "25Mg" => 0.002,
+        "26Mg" => 0.001,
+    )
+    abundance_file_total = sum(values(X_file))
+    X0 = X_file
+    abundance_path_display = "built-in fallback"
+else
+    abundance_path = project_abundance_paths[abundance_path]
+    X_file = read_initial_abundances(abundance_path; normalize=true)
+    abundance_file_total = sum(values(read_initial_abundances(abundance_path)); init=0.0)
+    X0 = Dict(name => value for (name, value) in X_file if haskey(network.species_index, name))
+    abundance_path_display = abundance_path
+end
+active_initial_mass = sum(values(X0); init=0.0)
+inert_initial_mass = sum(values(X_file); init=0.0) - active_initial_mass
+Y0 = abundances_from_mass_fractions(network, X0)
 
 times, history, solver_stats = solve_network_adaptive(
     network,
@@ -142,6 +196,10 @@ positivity = abundance_diagnostics(network, history)
 
 println("Mini nova trajectory network")
 println("trajectory = ", trajectory_path)
+println("initial abundances = ", abundance_path_display)
+println("initial abundance file total = ", abundance_file_total)
+println("active network initial mass = ", active_initial_mass)
+println("inert/outside-network initial mass = ", inert_initial_mass)
 println("validated reactions = ", validation.num_reactions)
 println("species = ", length(network.species))
 println("screening = ", screening_model)
