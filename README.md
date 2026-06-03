@@ -6,7 +6,7 @@ The long-term goal is to provide a user-friendly, fast, and physically accurate 
 
 ## Current status
 
-The project currently supports the first minimal single-zone network workflow:
+The project currently supports the single-zone network workflow:
 
 ```text
 STARLIB table -> Reaction -> ReactionNetwork -> dY/dt -> time evolution
@@ -15,7 +15,7 @@ STARLIB table -> Reaction -> ReactionNetwork -> dY/dt -> time evolution
 Implemented so far:
 
 - STARLIB-style rate table reading
-- reaction label parsing, e.g. `18F(p,α)15O`
+- reaction label parsing, e.g. `18F(p,α)15O`, `8B(β+)2α`, and `p(p,eν)d`
 - isotope/species name normalization
 - `ReactionRateTable`
 - `Reaction`
@@ -45,8 +45,14 @@ Implemented so far:
 - approximate weak charged-particle screening multiplier via `screening=:weak`
 - baryon-number and charge-conservation checks
 - explicit STARLIB reverse-rate lookup with `find_reverse_rate`
+- generated detailed-balance reverse rates for supported capture reactions
 - unsupported STARLIB chapter-layout reporting
 - STARLIB `26Al*` / `26Alm` isomer label support for the `al*6` entries
+- multiproduct STARLIB chapter support for beta-delayed proton/alpha channels
+- H-Ca nova network selection with active/inert/missing isotope diagnostics
+- post-processing weak decay output via `iso_massfDECAY.DAT`
+- Iliadis JCH1 comparison CSVs and terminal residual summaries
+- integrated flux reports for the largest abundance residuals
 - precomputed integer stoichiometry inside `ReactionNetwork`
 - adaptive solver diagnostics for accepted/rejected steps, timestep range, and Newton iterations
 - one-call single-zone post-processing from reaction labels and mass fractions
@@ -126,18 +132,18 @@ The current mini nova example uses `initial_abundance.dat` or
 is normalized before use, then species outside the active network are reported
 as inert/outside-network mass.
 
-The current mini nova example uses a 97-reaction, 88-active-species network over
+The current mini nova example uses a compact trajectory-driven network over
 CNO, NeNa, MgAl, Si-Ca, and a Ca-Fe/Ni seed extension, with explicit `26Al*`
 isomer channels. It runs with backward Euler and weak screening:
 
 ```text
-validated reactions = 97
-species = 88
+validated reactions = example-dependent
+species = example-dependent
 screening = weak
-active network initial mass ≈ 0.99995
-inert/outside-network initial mass ≈ 4.6e-5
+active network initial mass is reported
+inert/outside-network initial mass is reported
 total active-network mass is conserved
-Newton failed steps = 0
+Newton accepted/rejected step statistics are reported
 peak epsilon_nuc and integrated nuclear energy are printed as diagnostics
 ```
 
@@ -173,9 +179,10 @@ the per-timestep `.DAT` output writing. The one-zone ODE still advances forward
 in time sequentially, so this is not equivalent to splitting timesteps across
 workers.
 
-The script solves the active 97-reaction nova network with backward Euler and
-weak screening, then interpolates the abundance history onto the trajectory time
-grid. For the current 805-row trajectory it writes:
+The script builds an expanded H-Ca nova network from STARLIB, adds available
+reverse rates, solves it with backward Euler, and interpolates the abundance
+history onto the trajectory time grid. For the current 805-row trajectory it
+writes:
 
 ```text
 outputs/single_zone_nova_ppn/iso_massf00000.DAT
@@ -196,27 +203,43 @@ For a quick formatting check without writing every trajectory state:
 julia --project=. examples/single_zone_nova_ppn.jl --output-stride 100
 ```
 
+Useful comparison and diagnostic options:
+
+```sh
+julia --project=. examples/single_zone_nova_ppn.jl --jobs 8 --screening none --decay-time 3600
+```
+
+This can write `iso_massfDECAY.DAT`, comparison CSVs against the Iliadis JCH1
+reference when present, and integrated flux reports for the largest abundance
+residuals.
+
 ## Physics Roadmap
 
-Implemented:
+Current physics scope:
 
 - Explicit reverse-rate lookup with `find_reverse_rate`, for rates already
   present in STARLIB.
-- Approximate weak charged-particle screening as a multiplicative rate factor.
+- Generated detailed-balance reverse rates for supported capture reactions.
+- Approximate weak charged-particle screening as a multiplicative rate factor,
+  with `--screening none` available for baseline comparisons.
 - `26Al*`/`26Alm` parsing to STARLIB's `al*6` isomer entries, including isomer
   beta decay and proton capture in the mini network.
+- Post-processing decay over a user-supplied decay time. This is written as a
+  separate `iso_massfDECAY.DAT` file and does not change the hydrodynamic
+  trajectory solve.
 
-Not implemented yet:
+Known limits:
 
-- Reciprocal-rule reverse-rate synthesis. This needs nuclear partition
-  functions/statistical weights and careful detailed-balance bookkeeping; we
-  should not fake it from Q-values alone.
-- Strong/intermediate screening regimes. The current `screening=:weak` option
-  is an approximate Salpeter-style weak-screening multiplier.
-- Energy feedback coupling. This is intentionally out of scope for standard
-  single-zone PPN. It would require a separate self-heating one-zone mode with
-  `dT/dt = (epsilon_nuc - losses) / c_P`, an equation of state, heat capacity,
-  and an expansion/cooling model.
+- Reverse-rate synthesis is intentionally conservative. Full reciprocal-rule
+  support still needs partition functions/statistical weights and better
+  provenance checks.
+- Strong/intermediate screening regimes are not implemented. The current
+  `screening=:weak` option is an approximate Salpeter-style weak-screening
+  multiplier.
+- Energy feedback coupling is out of scope for standard single-zone PPN. It
+  would require a separate self-heating one-zone mode with `dT/dt =
+  (epsilon_nuc - losses) / c_P`, an equation of state, heat capacity, and an
+  expansion/cooling model.
 
 ## Core equations
 
@@ -254,341 +277,103 @@ The network evolves
 
 For a single-zone post-processing network, this is an ODE system, not a PDE, because there are no spatial derivatives yet.
 
-## AI GENERATED MILESTONES TO KEEP TRACK OF NETWORK STATUS AND WHAT I SHOULD IMPLEMENT
-
-### Milestone 1: Species registry and abundance helpers — done
-
-Goal: make initial conditions physically grounded and easy to use.
-
-Add:
-
-- `species_from_name(name)`
-- a species registry for common particles and nuclei
-- `Z` and `A` inference from names like `f18`, `o15`, `he4`, `p`
-- `abundances_from_mass_fractions(network, Xdict)`
-- `mass_fractions_from_abundances(network, Y)`
-- optional mass-fraction normalization checks
-
-Why this matters:
-
-Users usually specify initial composition as mass fractions. The solver evolves abundances. This milestone gives a safe bridge between user input and solver input.
-
----
-
-### Milestone 2: Network construction from reaction labels — done
-
-Goal: make network creation easy from STARLIB data.
-
-Add:
-
-- `reaction_from_label(tables, label; source=nothing)`
-- `network_from_labels(tables, labels; species=nothing, source=nothing)`
-- automatic species inference from selected reactions
-- helpful errors when a STARLIB reaction is missing or ambiguous
-
-Example target API:
-
-```julia
-tables = read_starlib()
-
-network = network_from_labels(
-    tables,
-    ["18F(p,α)15O", "18F(p,γ)19Ne"],
-)
-```
-
----
-
-### Milestone 3: First real single-zone example — done
-
-Goal: demonstrate the current network on a physically relevant nova reaction.
-
-Add an example script:
-
-```text
-examples/single_zone_18f.jl
-```
-
-The example should:
-
-- read STARLIB
-- build a small `18F` destruction network
-- define nova-like fixed conditions, e.g. `T9 = 0.2`, `rho = 1000.0`
-- define initial mass fractions
-- convert mass fractions to abundances
-- evolve the network
-- print final mass fractions
-- optionally save a CSV-like output file
-
-Possible first network:
-
-```text
-18F(p,α)15O
-18F(p,γ)19Ne
-```
-
----
-
-### Milestone 4: Adaptive timestep control — done
-
-Goal: make explicit integration safer without adding dependencies yet.
-
-Add a simple adaptive timestep option that limits the maximum fractional and
-absolute abundance change per step:
-
-```math
-\max_i \left|\frac{\Delta Y_i}{Y_i}\right| < \epsilon
-```
-
-Possible API:
-
-```julia
-solve_network_adaptive(
-    network,
-    Y0,
-    tspan,
-    dt_initial,
-    rho,
-    T9;
-    max_fractional_change=0.01,
-    max_absolute_change=1.0e-12,
-)
-```
-
-This is not a replacement for a stiff solver, but it will help avoid unstable fixed-step runs while the project remains dependency-light.
-
----
-
-### Milestone 5: STARLIB uncertainty sampling — done
-
-Goal: use STARLIB factor uncertainties correctly.
-
-STARLIB rates are commonly sampled as lognormal variations:
-
-```math
-R_{\mathrm{sampled}}(T) = R_{\mathrm{recommended}}(T) f_{\mathrm{unc}}(T)^p
-```
-
-where
-
-```math
-p \sim \mathcal{N}(0,1)
-```
-
-Add:
-
-- interpolation of `factor_uncertainty`
-- `sampled_interpolate_rate(table, T9, p)`
-- reaction-level uncertainty parameter storage
-- solver support for `rate_p_values`
-
-Possible API:
-
-```julia
-p_values = randn(length(network.reactions))
-
-times, history = solve_network(
-    network,
-    Y0,
-    tspan,
-    dt,
-    rho,
-    T9;
-    rate_p_values=p_values,
-)
-```
-
----
-
-### Milestone 6: Monte Carlo driver — done
-
-Goal: run repeated networks for uncertainty evaluation.
-
-Add:
-
-- `run_monte_carlo`
-- random sampling of STARLIB rate uncertainties
-- collection of final abundances
-- simple percentile summaries
-- reproducible random seeds
-
-Example target API:
-
-```julia
-results = run_monte_carlo(
-    network,
-    Y0,
-    tspan,
-    dt,
-    rho,
-    T9;
-    nruns=1000,
-    seed=1234,
-)
-```
-
-Output should eventually support:
-
-- final abundance distributions
-- median values
-- 16th/84th percentile intervals
-- sensitivity diagnostics
-
----
-
-### Milestone 7: Conservation and physics checks — done
-
-Goal: catch physically invalid reactions or bookkeeping mistakes.
-
-Add:
-
-- baryon number conservation checks
-- charge conservation checks
-- warnings for unsupported STARLIB chapters
-- optional network validation report
-
-For reaction
-
-```text
-18F(p,α)15O
-```
-
-check:
-
-```math
-18 + 1 = 4 + 15
-```
-
-and
-
-```math
-9 + 1 = 2 + 8
-```
-
----
-
-### Milestone 8: Energy generation diagnostics
-
-Goal: compute nuclear energy generation from reaction Q-values.
-
-Add:
-
-```math
-\epsilon \propto \sum_r Q_r F_r
-```
-
-This will initially be diagnostic only, not coupled back to temperature.
-
----
-
-### Milestone 9: Trajectory post-processing — done
-
-Goal: evolve a single-zone network over hydrodynamic nova trajectories.
-
-Add:
-
-- trajectory reader for `(time, T9, rho)` data
-- interpolation of trajectory profiles
-- solve network over trajectory conditions
-
-Target flow:
-
-```text
-trajectory file -> T9(t), rho(t) -> solve_network
-```
-
----
-
-### Milestone 9b: Full PPN abundance output — done
-
-Goal: write trajectory-indexed abundance output for the single-zone PPN workflow.
-
-Implemented in `examples/single_zone_nova_ppn.jl`:
-
-- root-level `trajectory.input` and `initial_abundance.DAT`/`.dat` discovery
-- expanded nova network solve over the full trajectory
-- interpolation from internal solver states onto trajectory output states
-- `iso_massfXXXXX.DAT` mass-fraction files with template-like headers
-- wide `mass_fractions.csv` with one row per written trajectory state
-- inert/outside-network isotope carry-through from the initial abundance file
-- `--jobs N` threaded Jacobian and DAT-output work for faster local runs
-
----
-
-### Milestone 10: Stiff solver research and implementation
-
-Goal: move toward production-quality integration. The first dependency-free
-implicit option is now implemented as `method=:backward_euler`, using Newton
-iterations with a finite-difference dense Jacobian.
-
-Explicit Euler and RK4 are useful for learning and small tests, but real nuclear networks are often stiff. The mini nova example now uses backward Euler by default and prints Newton statistics, positivity diagnostics, and a small `dt_max` convergence table.
-
-Later options:
-
-- exploit sparse reaction-network structure
-- evaluate whether using SciML/DifferentialEquations.jl is worthwhile despite adding a dependency
-
-This should come after the network API and physical bookkeeping are stable.
-
-## Recently completed next steps
-
-The first eight roadmap implementation steps are now complete:
-
-1. Added `species_from_name` and a built-in element/species registry.
-2. Extended `ReactionNetwork` with `species_info`, so each network species has accessible `A` and `Z`.
-3. Added mass-fraction to abundance conversion for an entire network.
-4. Added abundance to mass-fraction conversion for output.
-5. Added tests for species parsing and abundance conversion.
-6. Added `reaction_from_label` and `network_from_labels`.
-7. Created `examples/single_zone_18f.jl`.
-8. Ran the example using real STARLIB data.
-
-## Recently completed diagnostics work
-
-The flux-analysis and graph-diagnostics implementation plan is now complete:
-
-1. Added `reaction_string(reaction)`.
-2. Added `reaction_fluxes(network, Y, rho, T9)`.
-3. Added `reaction_flux_history(network, history, times, rho, T9)`.
-4. Added `integrated_fluxes(times, flux_history)`.
-5. Added `species_flux_balance(network, Y, rho, T9)`.
-6. Added `reaction_edges(network)` for graph-like external plotting data.
-7. Updated `examples/single_zone_18f.jl` to print integrated reaction fluxes.
-8. Added `examples/oxygen_fluorine_mini_network.jl`.
-
-## Recently completed validation work
-
-The basic physics/bookkeeping validation layer is now complete:
-
-1. Added `reaction_conservation(reaction)`.
-2. Added `network_validation_report(network; throw_on_error=false)`.
-3. Validation checks reaction baryon-number conservation.
-4. Validation checks reaction charge conservation.
-5. Validation checks consistency of `species`, `species_info`, and `species_index`.
-6. Validation checks that reaction species are present in the network.
-7. Examples now call `network_validation_report(network; throw_on_error=true)` before solving.
-
-## Recently completed uncertainty work
-
-The first STARLIB uncertainty propagation layer is now complete:
-
-1. Added `interpolate_factor_uncertainty(table, T9)`.
-2. Added `sampled_interpolate_rate(table, T9, p)`.
-3. Connected sampled STARLIB rates to `reaction_flux` using `rate_p_value`.
-4. Connected sampled STARLIB rates to `reaction_fluxes`, `network_rhs`, and `solve_network` using `rate_p_values`.
-5. Added `run_monte_carlo(...)` for repeated single-zone uncertainty runs.
-6. Added `examples/monte_carlo_18f.jl`.
-
-## Immediate next steps
-
-Recommended next implementation order:
-
-1. Verify the expanded network against the STARLIB rates needed for the target nova regime.
-2. Add a network coverage report for active, inert, missing, and template-only isotopes.
-3. Add reciprocal-rule reverse rates with partition-function support.
-4. Replace dense finite-difference Jacobians with sparse/structured Jacobian assembly.
-5. Add optional flux-history and energy-history CSV outputs beside the mass-fraction CSV.
-6. Design the MPPN stage: multiple zones, zone masses, and mixing coefficients.
+## Milestones
+
+### Milestone 1: Iliadis baseline reproduction
+
+Goal: make the single-zone PPN output comparable to the Iliadis JCH1 baseline
+for the same initial composition, thermodynamic history, and decay convention.
+
+Tasks:
+
+- Reconstruct or replace the digitized `trajectory.input` with the actual
+  one-zone thermodynamic history used for the Iliadis comparison.
+- Track final-state and post-decay residuals against
+  `outputs/iliadis2002_jch1/iso_massf00000.DAT`.
+- Use the integrated flux report to identify whether each major residual is
+  caused by trajectory mismatch, missing rate data, missing reaction channels,
+  or solver/network behavior.
+- Add a stable comparison artifact for notebooks: isotope, reference mass
+  fraction, model mass fraction, ratio, log residual, group, and active/inert
+  status.
+
+### Milestone 2: H-Ca network completeness audit
+
+Goal: verify that the active network can represent the same physical reaction
+space as a 142-isotope nova post-processing network from hydrogen through
+calcium.
+
+Tasks:
+
+- Keep the H-Ca selector close to the Iliadis isotope/reaction scope without
+  silently adding irrelevant heavy-ion or neutron-only channels.
+- Produce a tracked network audit table for selected, skipped, unsupported, and
+  missing STARLIB rows.
+- Separate skipped rows by reason: unsupported chapter layout, no active
+  species path, disintegration bookkeeping, neutron-induced branch, heavy-ion
+  branch, or missing rate data.
+- Add tests that pin the expected parser behavior for multiproduct weak decays,
+  pp-chain light-particle reactions, and common nova breakout branches.
+
+### Milestone 3: Reaction-rate data provenance
+
+Goal: make every important reaction rate traceable and replace weak STARLIB
+coverage with better data where needed.
+
+Tasks:
+
+- Add a rate provenance report for the nova example: STARLIB source tag,
+  explicit reverse rate, generated reverse rate, or unavailable.
+- Identify the h-burning and He-burning reactions whose STARLIB rates are
+  missing or clearly not suitable for the Iliadis baseline.
+- Add an import path for supplemental Reaclib rates without replacing STARLIB
+  as the primary source.
+- Prefer explicit reverse rates from data when available; use generated
+  detailed-balance rates only when the reaction class and metadata are safe.
+
+### Milestone 4: Post-decay policy
+
+Goal: make post-calculation decay physically explicit rather than hard-coded to
+an Iliadis-specific mode.
+
+Tasks:
+
+- Keep `--decay-time S` as the user-facing control.
+- Write post-decay output only to `iso_massfDECAY.DAT`, leaving the final
+  network state untouched.
+- Add a decay report showing active weak branches, half-lives/rates, parents,
+  daughters, and mass moved during the post-decay interval.
+- Decide how to handle unresolved long-lived isomers and branches that require
+  data not present in the selected rate tables.
+
+### Milestone 5: Solver robustness and performance
+
+Goal: keep the expanded network stable enough for routine local nova runs while
+preserving transparent diagnostics.
+
+Tasks:
+
+- Replace dense finite-difference Jacobians with sparse or structured Jacobian
+  assembly.
+- Add optional flux-history and energy-history CSV outputs beside the
+  mass-fraction CSV.
+- Track Newton failure modes by timestep, temperature, density, and dominant
+  reaction flux.
+- Evaluate whether SciML/DifferentialEquations.jl is worth adding once the
+  network physics and data provenance are stable.
+
+### Milestone 6: Beyond single-zone PPN
+
+Goal: prepare for MPPN/TPPN without mixing it into the current validation
+target.
+
+Tasks:
+
+- Keep single-zone PPN trajectory-prescribed and energy-diagnostic only.
+- Design the MPPN data model: zones, zone masses, thermodynamic histories, and
+  mixing coefficients.
+- Define what outputs should remain compatible with the current
+  `iso_massfXXXXX.DAT` format.
 
 ## Learning path
 
