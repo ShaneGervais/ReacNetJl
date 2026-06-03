@@ -17,10 +17,18 @@ export Species,
     read_trajectory,
     read_initial_abundances,
     trajectory_profiles,
+    first_cooling_threshold_time,
+    first_mass_fraction_threshold_crossing,
     starlib_chapter_report,
     find_rate,
     find_reverse_rate,
     reaction_from_label,
+    generated_detailed_balance_reverse_table,
+    add_reverse_reaction_tables,
+    select_h_ca_reaction_tables,
+    select_decay_reaction_tables,
+    decay_mass_fractions,
+    network_from_tables,
     network_from_labels,
     weak_screening_multiplier,
     abundances_from_mass_fractions,
@@ -163,7 +171,7 @@ function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::A
     return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions, compiled_reactions)
 end
 
-const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib_v610_120222.dat/starlib.dat")
+const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "./starlib.dat")
 const STARLIB_ROWS_PER_REACTION = 60
 const AVOGADRO = 6.02214076e23
 const MEV_TO_ERG = 1.602176634e-6
@@ -222,7 +230,10 @@ Examples:
 - `"γ" -> "gamma"`
 =#
 function normalize_species_name(name::AbstractString)
-    s = lowercase(strip(name))
+    raw = lowercase(strip(name))
+    raw == "al-6" && return "al26"
+
+    s = raw
     s = replace(s, " " => "", "-" => "", "_" => "")
     s = replace(s, "α" => "alpha", "γ" => "gamma")
 
@@ -304,6 +315,7 @@ vectors.
 Examples:
 - `parse_reaction_label("18F(p,α)15O") == (["p", "f18"], ["he4", "o15"])`
 - `parse_reaction_label("18F(p,γ)19Ne") == (["p", "f18"], ["ne19"])`
+- `parse_reaction_label("p(p,eν)d") == (["p", "p"], ["d"])`
 =#
 function _is_beta_token(token::AbstractString)
     s = lowercase(strip(token))
@@ -311,12 +323,44 @@ function _is_beta_token(token::AbstractString)
     return s in ("beta+", "b+", "β+", "betaplus", "ec", "electroncapture", "beta-", "b-", "β-", "betaminus")
 end
 
+function _parse_particle_multiplicity(token::AbstractString)
+    s = lowercase(strip(token))
+    s = replace(s, " " => "", "α" => "alpha")
+    m = match(r"^([2-9])([a-z\+]+)$", s)
+    m === nothing && return nothing
+
+    count = parse(Int, m.captures[1])
+    particle = m.captures[2]
+    particle in ("p", "n", "d", "t", "alpha") || return nothing
+    normalized = normalize_species_name(particle)
+    return fill(normalized, count)
+end
+
+function _is_non_nuclear_ejectile_token(token::AbstractString)
+    s = lowercase(strip(token))
+    s = replace(s, " " => "", "ν" => "nu")
+    return s in ("enu", "e+nu", "e-nu", "nu", "neutrino")
+end
+
+function _parse_reaction_token(token::AbstractString; allow_multiplicity::Bool=false)
+    _is_non_nuclear_ejectile_token(token) && return String[]
+
+    if allow_multiplicity
+        particles = _parse_particle_multiplicity(token)
+        particles !== nothing && return particles
+    end
+
+    normalized = normalize_species_name(token)
+    normalized == "gamma" && return String[]
+    return [normalized]
+end
+
 function parse_reaction_label(label::AbstractString)
     decay_match = match(r"^\s*([^\(]+)\(([^,\)]+)\)(.+?)\s*$", label)
     if decay_match !== nothing && _is_beta_token(decay_match.captures[2])
         parent = normalize_species_name(decay_match.captures[1])
-        daughter = normalize_species_name(decay_match.captures[3])
-        return [parent], [daughter]
+        products = _parse_reaction_token(decay_match.captures[3]; allow_multiplicity=true)
+        return [parent], products
     end
 
     m = match(r"^\s*([^\(]+)\(([^,]+),([^\)]+)\)(.+?)\s*$", label)
@@ -324,11 +368,11 @@ function parse_reaction_label(label::AbstractString)
 
     target = normalize_species_name(m.captures[1])
     projectile = normalize_species_name(m.captures[2])
-    ejectile = normalize_species_name(m.captures[3])
+    ejectiles = _parse_reaction_token(m.captures[3]; allow_multiplicity=true)
     product = normalize_species_name(m.captures[4])
 
     reactants = [projectile, target]
-    products = ejectile == "gamma" ? [product] : [ejectile, product]
+    products = vcat(ejectiles, [product])
     return reactants, products
 end
 
@@ -434,6 +478,58 @@ function mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix
     return X_history
 end
 
+function first_mass_fraction_threshold_crossing(
+    network::ReactionNetwork,
+    times::AbstractVector{<:Real},
+    history::AbstractMatrix{<:Real},
+    species::AbstractString,
+    threshold::Real;
+    direction::Symbol=:down,
+)
+    length(times) == size(history, 1) || throw(ArgumentError("times length must match the number of history rows"))
+    size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
+    direction in (:down, :up) || throw(ArgumentError("direction must be :down or :up"))
+
+    limit = Float64(threshold)
+    limit >= 0.0 || throw(ArgumentError("threshold must be non-negative"))
+    name = normalize_species_name(species)
+    haskey(network.species_index, name) || throw(ArgumentError("species '$species' is not present in the network"))
+    index = network.species_index[name]
+    A = network.species_info[index].A
+
+    mass_fraction_at(row) = mass_fraction_from_abundance(history[row, index], A)
+    initial = mass_fraction_at(firstindex(times))
+    if (direction == :down && initial <= limit) || (direction == :up && initial >= limit)
+        return (
+            time=Float64(first(times)),
+            state=copy(history[firstindex(times), :]),
+            previous_index=firstindex(times),
+            fraction=0.0,
+            mass_fraction=initial,
+        )
+    end
+
+    for i in firstindex(times):(lastindex(times)-1)
+        x0 = mass_fraction_at(i)
+        x1 = mass_fraction_at(i + 1)
+        crossed = direction == :down ? (x0 >= limit && x1 <= limit) : (x0 <= limit && x1 >= limit)
+        crossed || continue
+
+        fraction = x0 == x1 ? 0.0 : (limit - x0) / (x1 - x0)
+        stop_time = Float64(times[i]) + fraction * Float64(times[i+1] - times[i])
+        state = (1.0 - fraction) .* history[i, :] .+ fraction .* history[i+1, :]
+        return (
+            time=stop_time,
+            state=Vector{Float64}(state),
+            previous_index=i,
+            fraction=fraction,
+            mass_fraction=limit,
+        )
+    end
+
+    return nothing
+end
+
 #=
     total_mass_fraction(network, Y)
 
@@ -529,12 +625,24 @@ function abundance_diagnostics(network::ReactionNetwork, history::AbstractMatrix
 end
 
 function _split_starlib_species(chapter::Int, species::Vector{String})
-    if chapter == 1 && length(species) == 2
-        return [species[1]], [species[2]]
-    elseif chapter in (2, 4) && length(species) == 3
-        return species[1:2], [species[3]]
-    elseif chapter in (4, 5) && length(species) == 4
-        return species[1:2], species[3:4]
+    arities = Dict(
+        1 => (1, 1),
+        2 => (1, 2),
+        3 => (1, 3),
+        4 => (2, 1),
+        5 => (2, 2),
+        6 => (2, 3),
+        7 => (2, 4),
+        8 => (3, 1),
+        9 => (3, 2),
+        10 => (4, 2),
+    )
+
+    if haskey(arities, chapter)
+        nreactants, nproducts = arities[chapter]
+        if length(species) == nreactants + nproducts
+            return species[1:nreactants], species[(nreactants + 1):end]
+        end
     end
 
     # Conservative fallback: keep the raw STARLIB order if this chapter is not
@@ -545,11 +653,22 @@ end
 function _supported_starlib_layout(chapter::Int, nspecies::Int)
     return (chapter == 1 && nspecies == 2) ||
            (chapter in (2, 4) && nspecies == 3) ||
-           (chapter in (4, 5) && nspecies == 4)
+           (chapter in (3, 5, 8) && nspecies == 4) ||
+           (chapter in (6, 9) && nspecies == 5) ||
+           (chapter in (7, 10) && nspecies == 6)
 end
 
 function _supported_rate_table(table::ReactionRateTable)
     return !isempty(table.reactants) && !isempty(table.products)
+end
+
+function _valid_nuclear_bookkeeping(table::ReactionRateTable)
+    _supported_rate_table(table) || return false
+    return try
+        reaction_conservation(Reaction(table)).valid_nuclear_bookkeeping
+    catch
+        false
+    end
 end
 
 #=
@@ -754,6 +873,27 @@ function trajectory_profiles(trajectory::Trajectory)
     return (rho=rho_profile, T9=T9_profile)
 end
 
+function first_cooling_threshold_time(trajectory::Trajectory, threshold_T9::Real)
+    threshold = Float64(threshold_T9)
+    threshold > 0.0 || throw(ArgumentError("threshold_T9 must be positive"))
+
+    peak_index = argmax(trajectory.T9)
+    for i in peak_index:(length(trajectory.time)-1)
+        T0 = trajectory.T9[i]
+        T1 = trajectory.T9[i+1]
+        t0 = trajectory.time[i]
+        t1 = trajectory.time[i+1]
+
+        T0 == threshold && return t0
+        if T0 > threshold && T1 <= threshold
+            fraction = (threshold - T0) / (T1 - T0)
+            return t0 + fraction * (t1 - t0)
+        end
+    end
+
+    return nothing
+end
+
 function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH; warn_unsupported::Bool=false)
     tables = ReactionRateTable[]
     unsupported_counts = Dict{Int,Int}()
@@ -838,6 +978,133 @@ function find_reverse_rate(tables::AbstractVector{ReactionRateTable}, label::Abs
     return filter(t -> lowercase(t.source) == wanted, matches)
 end
 
+function _reaction_participant_key(table::ReactionRateTable)
+    return (Tuple(table.reactants), Tuple(table.products))
+end
+
+function _unique_reaction_tables(tables::AbstractVector{ReactionRateTable})
+    seen = Set{Any}()
+    selected = ReactionRateTable[]
+    for table in tables
+        key = _reaction_participant_key(table)
+        key in seen && continue
+        push!(selected, table)
+        push!(seen, key)
+    end
+    return selected
+end
+
+function _reverse_table_lookup(tables::AbstractVector{ReactionRateTable})
+    lookup = Dict{Any,ReactionRateTable}()
+    for table in tables
+        _valid_nuclear_bookkeeping(table) || continue
+        key = _reaction_participant_key(table)
+        haskey(lookup, key) || (lookup[key] = table)
+    end
+    return lookup
+end
+
+function _mass_number_factor(names::AbstractVector{String})
+    factor = 1.0
+    for name in names
+        factor *= species_from_name(name).A
+    end
+    return factor
+end
+
+function _can_generate_detailed_balance_reverse(table::ReactionRateTable)
+    return length(table.reactants) == 2 &&
+           length(table.products) == 1 &&
+           table.q_value > 0.0
+end
+
+const DETAILED_BALANCE_CAPTURE_CONSTANT = 9.86851e9
+const DETAILED_BALANCE_Q_FACTOR = 11.605
+const GENERATED_REVERSE_RATE_FLOOR = 1.0e-300
+const LOG_INTERPOLATION_FLOOR = 1.0e-300
+
+#=
+    generated_detailed_balance_reverse_table(table)
+
+Generate an approximate detailed-balance reverse table for a radiative-capture
+style two-body forward reaction `a + b -> c`. STARLIB does not include partition
+functions or spin factors in the parsed data, so this intentionally uses the
+standard mass-factor and Boltzmann term only. Prefer explicit STARLIB reverse
+tables when they exist.
+=#
+function generated_detailed_balance_reverse_table(table::ReactionRateTable; source::AbstractString="detail_balance")
+    _can_generate_detailed_balance_reverse(table) || throw(ArgumentError("can only generate detailed-balance reverse rates for exothermic two-body to one-body reactions"))
+
+    product_mass = _mass_number_factor(table.products)
+    reactant_mass = _mass_number_factor(table.reactants)
+    mass_factor = (reactant_mass / product_mass)^(3.0 / 2.0)
+
+    reverse_rate = Float64[]
+    sizehint!(reverse_rate, length(table.T9))
+    for (T9, forward_rate) in zip(table.T9, table.rate)
+        boltzmann = exp(-DETAILED_BALANCE_Q_FACTOR * table.q_value / T9)
+        value = DETAILED_BALANCE_CAPTURE_CONSTANT * T9^(3.0 / 2.0) * mass_factor * forward_rate * boltzmann
+        push!(reverse_rate, max(value, GENERATED_REVERSE_RATE_FLOOR))
+    end
+
+    return ReactionRateTable(
+        1,
+        copy(table.products),
+        copy(table.reactants),
+        string(source),
+        -table.q_value,
+        copy(table.T9),
+        reverse_rate,
+        copy(table.factor_uncertainty),
+    )
+end
+
+#=
+    add_reverse_reaction_tables(all_tables, forward_tables; generate_detailed_balance=true)
+
+Return a named tuple containing forward tables plus reverse tables. Exact
+reverse STARLIB entries are preferred. If no explicit reverse exists and the
+forward table is a supported radiative-capture-style `2 -> 1` reaction, an
+approximate detailed-balance reverse table is generated.
+=#
+function add_reverse_reaction_tables(
+    all_tables::AbstractVector{ReactionRateTable},
+    forward_tables::AbstractVector{ReactionRateTable};
+    generate_detailed_balance::Bool=true,
+)
+    reverse_lookup = _reverse_table_lookup(all_tables)
+    selected = _unique_reaction_tables(forward_tables)
+    seen = Set{Any}(_reaction_participant_key(table) for table in selected)
+    explicit = 0
+    generated = 0
+    missing = 0
+
+    for table in copy(selected)
+        reverse_key = (Tuple(table.products), Tuple(table.reactants))
+        if haskey(reverse_lookup, reverse_key)
+            reverse_table = reverse_lookup[reverse_key]
+            key = _reaction_participant_key(reverse_table)
+            if !(key in seen)
+                push!(selected, reverse_table)
+                push!(seen, key)
+            end
+            explicit += 1
+        elseif generate_detailed_balance && _can_generate_detailed_balance_reverse(table)
+            reverse_table = generated_detailed_balance_reverse_table(table)
+            key = _reaction_participant_key(reverse_table)
+            if !(key in seen)
+                push!(selected, reverse_table)
+                push!(seen, key)
+            end
+            generated += 1
+        else
+            missing += 1
+        end
+    end
+
+    return (tables=selected, explicit=explicit, generated=generated, missing=missing)
+end
+
 function _select_rate_table(matches::Vector{ReactionRateTable}, label::AbstractString, on_multiple::Symbol)
     isempty(matches) && throw(ArgumentError("no STARLIB rate found for reaction '$label'"))
 
@@ -885,6 +1152,218 @@ function _infer_species_from_reactions(reactions::AbstractVector{Reaction})
     return species
 end
 
+function _h_ca_candidate_species(
+    name::AbstractString;
+    zmax::Int=20,
+    amax::Int=46,
+    proton_rich_margin::Int=4,
+    neutron_rich_margin::Int=3,
+)
+    normalized = normalize_species_name(name)
+    normalized in ("n", "p", "d", "t", "he3", "he4") && return true
+
+    species = try
+        species_from_name(normalized)
+    catch
+        return false
+    end
+
+    species.Z < 1 && return false
+    species.Z > zmax && return false
+    species.A > amax && return false
+
+    neutron_number = species.A - species.Z
+    neutron_number < max(0, species.Z - proton_rich_margin) && return false
+    neutron_number > species.Z + neutron_rich_margin && return false
+    return true
+end
+
+#=
+    select_h_ca_reaction_tables(tables, seed_species)
+
+Select a broader H-Ca nova post-processing network from STARLIB. The selector is
+deliberately less broad than "all H-Ca rows": it starts from the supplied seed
+composition, follows weak, proton, and alpha links, and keeps species inside a
+bounded stable/proton-rich isotope band. This keeps single-zone examples
+tractable while covering the main H-Ca nova flows.
+=#
+function select_h_ca_reaction_tables(
+    tables::AbstractVector{ReactionRateTable},
+    seed_species;
+    zmax::Int=20,
+    amax::Int=46,
+    proton_rich_margin::Int=4,
+    neutron_rich_margin::Int=3,
+    include_weak::Bool=true,
+    projectiles=("p", "he4", "he3", "d"),
+)
+    normalized_seed_species = Set(normalize_species_name.(collect(seed_species)))
+    push!(normalized_seed_species, "n")
+    push!(normalized_seed_species, "p")
+    push!(normalized_seed_species, "he4")
+
+    physical_species(name) = _h_ca_candidate_species(
+        name;
+        zmax=zmax,
+        amax=amax,
+        proton_rich_margin=proton_rich_margin,
+        neutron_rich_margin=neutron_rich_margin,
+    )
+
+    function candidate_table(table)
+        _valid_nuclear_bookkeeping(table) || return false
+        all(physical_species, vcat(table.reactants, table.products)) || return false
+        include_weak && length(table.reactants) == 1 && _weak_source(table.source) && return true
+        return any(projectile -> projectile in table.reactants, projectiles)
+    end
+
+    candidates = [table for table in tables if candidate_table(table)]
+    selected = ReactionRateTable[]
+    selected_keys = Set{Any}()
+    species = copy(normalized_seed_species)
+
+    changed = true
+    while changed
+        changed = false
+        for table in candidates
+            all(reactant -> reactant in species, table.reactants) || continue
+
+            key = _reaction_participant_key(table)
+            if !(key in selected_keys)
+                push!(selected, table)
+                push!(selected_keys, key)
+            end
+
+            for product in table.products
+                if !(product in species)
+                    push!(species, product)
+                    changed = true
+                end
+            end
+        end
+    end
+
+    return selected
+end
+
+function network_from_tables(tables::AbstractVector{ReactionRateTable}; species=nothing)
+    reactions = [Reaction(table) for table in _unique_reaction_tables(tables)]
+    network_species = species === nothing ? _infer_species_from_reactions(reactions) : collect(species)
+    return ReactionNetwork(network_species, reactions)
+end
+
+function _weak_source(source::AbstractString)
+    s = lowercase(strip(source))
+    return occursin("w", s) ||
+           s == "ec" ||
+           occursin("bet", s) ||
+           occursin("weak", s)
+end
+
+function select_decay_reaction_tables(tables::AbstractVector{ReactionRateTable}, seed_species)
+    species = Set(normalize_species_name.(collect(seed_species)))
+    candidates = [
+        table for table in tables
+        if length(table.reactants) == 1 &&
+           _valid_nuclear_bookkeeping(table) &&
+           _weak_source(table.source)
+    ]
+
+    selected = ReactionRateTable[]
+    selected_keys = Set{Any}()
+    changed = true
+    while changed
+        changed = false
+        for table in candidates
+            only(table.reactants) in species || continue
+
+            key = _reaction_participant_key(table)
+            if !(key in selected_keys)
+                push!(selected, table)
+                push!(selected_keys, key)
+            end
+
+            for product in table.products
+                if !(product in species)
+                    push!(species, product)
+                    changed = true
+                end
+            end
+        end
+    end
+
+    return selected
+end
+
+function _decay_generator_matrix(network::ReactionNetwork, T9::Real)
+    n = length(network.species)
+    generator = zeros(Float64, n, n)
+    for (reaction, compiled) in zip(network.reactions, network.compiled_reactions)
+        length(compiled.reactant_species_indices) == 1 || continue
+        source_index = only(compiled.reactant_species_indices)
+        rate = interpolate_rate(reaction.rate_table, T9)
+        for row in 1:n
+            delta = compiled.stoichiometric_delta[row]
+            delta == 0.0 && continue
+            generator[row, source_index] += delta * rate
+        end
+    end
+    return generator
+end
+
+function decay_mass_fractions(
+    tables::AbstractVector{ReactionRateTable},
+    X::AbstractDict,
+    decay_time_s::Real;
+    T9::Real=0.1,
+)
+    decay_time = Float64(decay_time_s)
+    decay_time >= 0.0 || throw(ArgumentError("decay_time_s must be non-negative"))
+
+    normalized_X = Dict(normalize_species_name(string(name)) => Float64(value) for (name, value) in X)
+    decay_time == 0.0 && return (
+        mass_fractions=copy(normalized_X),
+        decay_tables=ReactionRateTable[],
+        network=nothing,
+        times=Float64[0.0],
+    )
+
+    decay_tables = select_decay_reaction_tables(tables, keys(normalized_X))
+    isempty(decay_tables) && return (
+        mass_fractions=copy(normalized_X),
+        decay_tables=decay_tables,
+        network=nothing,
+        times=Float64[0.0, decay_time],
+    )
+
+    species = sort!(collect(union(Set(keys(normalized_X)), Set(_infer_species_from_reactions(Reaction.(decay_tables))))); by=name -> begin
+        info = species_from_name(name)
+        (info.Z, info.A, name)
+    end)
+    network = network_from_tables(decay_tables; species=species)
+    X0 = Dict(name => get(normalized_X, name, 0.0) for name in network.species)
+    Y0 = abundances_from_mass_fractions(network, X0)
+
+    generator = _decay_generator_matrix(network, T9)
+    Y_final = exp(decay_time * generator) * Y0
+    for i in eachindex(Y_final)
+        if Y_final[i] < 0.0 && abs(Y_final[i]) <= 1.0e-30
+            Y_final[i] = 0.0
+        end
+    end
+    decayed_X = mass_fractions_from_abundances(network, Y_final)
+    for (name, value) in decayed_X
+        normalized_X[name] = value
+    end
+
+    return (
+        mass_fractions=normalized_X,
+        decay_tables=decay_tables,
+        network=network,
+        times=Float64[0.0, decay_time],
+    )
+end
+
 #=
     network_from_labels(tables, labels; species=nothing, source=nothing, on_multiple=:error)
 
@@ -922,13 +1401,10 @@ function _interpolate_loglog(grid::AbstractVector{<:Real}, values::AbstractVecto
         return Float64(values[i])
     end
 
-    values[i] > 0.0 || throw(ArgumentError("cannot log-interpolate non-positive $value_name at lower grid point"))
-    values[i+1] > 0.0 || throw(ArgumentError("cannot log-interpolate non-positive $value_name at upper grid point"))
-
     x0 = log(grid[i])
     x1 = log(grid[i+1])
-    y0 = log(values[i])
-    y1 = log(values[i+1])
+    y0 = log(max(Float64(values[i]), LOG_INTERPOLATION_FLOOR))
+    y1 = log(max(Float64(values[i+1]), LOG_INTERPOLATION_FLOOR))
     weight = (log(T) - x0) / (x1 - x0)
     return exp((1 - weight) * y0 + weight * y1)
 end
@@ -1238,27 +1714,89 @@ Return a compact, normalized reaction label for display or diagnostics.
 For common two-body STARLIB reactions, this returns labels like
 `"f18(p,he4)o15"` or `"f18(p,γ)ne19"`.
 =#
-function reaction_string(reaction::Reaction)
-    if length(reaction.reactants) == 2 && length(reaction.products) == 1
-        projectile, target = reaction.reactants
-        product = only(reaction.products)
-        return "$(target)($(projectile),γ)$(product)"
-    elseif length(reaction.reactants) == 2 && length(reaction.products) == 2
-        projectile, target = reaction.reactants
-        ejectile, product = reaction.products
-        return "$(target)($(projectile),$(ejectile))$(product)"
-    elseif length(reaction.reactants) == 1 && length(reaction.products) == 1
-        parent = species_from_name(only(reaction.reactants))
-        daughter = species_from_name(only(reaction.products))
-        if parent.A == daughter.A && parent.Z == daughter.Z + 1
-            return "$(parent.name)(β+)$(daughter.name)"
-        elseif parent.A == daughter.A && parent.Z + 1 == daughter.Z
-            return "$(parent.name)(β-)$(daughter.name)"
-        end
-        return "$(only(reaction.reactants))->$(only(reaction.products))"
+function _display_species_name(name::AbstractString)
+    normalized = normalize_species_name(name)
+    normalized == "p" && return "p"
+    normalized == "n" && return "n"
+    normalized == "d" && return "d"
+    normalized == "t" && return "t"
+    normalized == "he4" && return "α"
+    normalized == "he3" && return "3He"
+
+    m = match(r"^([a-z]+)\*(\d+)$", normalized)
+    if m !== nothing
+        species = species_from_name(normalized)
+        return string(species.A, uppercasefirst(m.captures[1]), "*")
     end
 
-    return join(reaction.reactants, "+") * "->" * join(reaction.products, "+")
+    species = species_from_name(normalized)
+    symbol_match = match(r"^([a-z]+)\d+$", normalized)
+    symbol = symbol_match === nothing ? normalized : symbol_match.captures[1]
+    return string(species.A, uppercasefirst(symbol))
+end
+
+function _format_species_group(names::AbstractVector{String})
+    isempty(names) && return "γ"
+
+    parts = String[]
+    seen = Set{String}()
+    for name in names
+        normalized = normalize_species_name(name)
+        normalized in seen && continue
+        multiplicity = Base.count(==(normalized), normalize_species_name.(names))
+        label = _display_species_name(normalized)
+        push!(parts, multiplicity == 1 ? label : string(multiplicity, label))
+        push!(seen, normalized)
+    end
+    return join(parts, "+")
+end
+
+function _weak_symbol(delta_Z::Int)
+    delta_Z == -1 && return "β+"
+    delta_Z == 1 && return "β-"
+    return "weak"
+end
+
+function reaction_string(reaction::Reaction)
+    conservation = reaction_conservation(reaction)
+
+    if conservation.is_weak_decay
+        weak = _weak_symbol(conservation.delta_Z)
+        if length(reaction.reactants) == 1
+            return string(_format_species_group(reaction.reactants), "(", weak, ")", _format_species_group(reaction.products))
+        elseif length(reaction.reactants) == 2
+            projectile, target = reaction.reactants
+            return string(
+                _display_species_name(target),
+                "(",
+                _display_species_name(projectile),
+                ",eν)",
+                _format_species_group(reaction.products),
+            )
+        end
+        return string(_format_species_group(reaction.reactants), "(", weak, ")->", _format_species_group(reaction.products))
+    end
+
+    if length(reaction.reactants) == 2
+        projectile, target = reaction.reactants
+        if length(reaction.products) == 1
+            return string(_display_species_name(target), "(", _display_species_name(projectile), ",γ)", _format_species_group(reaction.products))
+        elseif length(reaction.products) >= 2
+            ejectiles = reaction.products[1:end-1]
+            product = reaction.products[end:end]
+            return string(
+                _display_species_name(target),
+                "(",
+                _display_species_name(projectile),
+                ",",
+                _format_species_group(ejectiles),
+                ")",
+                _format_species_group(product),
+            )
+        end
+    end
+
+    return _format_species_group(reaction.reactants) * "->" * _format_species_group(reaction.products)
 end
 
 #=
@@ -1501,10 +2039,10 @@ function reaction_conservation(reaction::Reaction)
     product_Z = _species_property_sum(reaction.products, :Z)
     delta_A = product_A - reactant_A
     delta_Z = product_Z - reactant_Z
-    is_weak_decay = length(reaction.reactants) == 1 && length(reaction.products) == 1 && delta_A == 0 && abs(delta_Z) == 1
+    is_weak_decay = delta_A == 0 && abs(delta_Z) == 1
 
     return (
-        reaction=reaction_string(reaction),
+        reaction=join(reaction.reactants, "+") * "->" * join(reaction.products, "+"),
         reactant_A=reactant_A,
         product_A=product_A,
         delta_A=delta_A,
@@ -1668,6 +2206,29 @@ function _max_abs(values::AbstractVector{<:Real})
     maximum(abs, values; init=0.0)
 end
 
+function _all_finite(values::AbstractVector{<:Real})
+    all(isfinite, values)
+end
+
+function _positivity_limited_alpha(Y::Vector{Float64}, correction::Vector{Float64})
+    alpha = 1.0
+    for i in eachindex(Y)
+        correction[i] < 0.0 || continue
+        Y[i] > 0.0 || continue
+        alpha = min(alpha, 0.9 * Y[i] / -correction[i])
+    end
+    return clamp(alpha, 0.0, 1.0)
+end
+
+function _clamp_tiny_negative_trials!(Y::Vector{Float64}, floor::Float64)
+    for i in eachindex(Y)
+        if Y[i] < 0.0 && abs(Y[i]) <= floor
+            Y[i] = 0.0
+        end
+    end
+    return Y
+end
+
 struct NewtonConvergenceError <: Exception
     iterations::Int
     residual_norm::Float64
@@ -1727,6 +2288,7 @@ function _backward_euler_step(
     end
 
     for iteration in 1:max_newton_iterations
+        residual_norm = _max_abs(residual)
         jacobian = _backward_euler_jacobian(
             network,
             Y_next,
@@ -1742,9 +2304,47 @@ function _backward_euler_step(
             screening=screening,
         )
         correction = jacobian \ (-residual)
-        Y_next .+= correction
 
-        residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        _all_finite(correction) || throw(NewtonConvergenceError(iteration, residual_norm))
+
+        accepted_trial = false
+        best_trial = copy(Y_next)
+        best_residual = copy(residual)
+        best_residual_norm = residual_norm
+        alpha = _positivity_limited_alpha(Y_next, correction)
+        alpha = alpha > 0.0 ? alpha : 1.0
+
+        for _ in 1:12
+            trial = Y_next .+ alpha .* correction
+            _clamp_tiny_negative_trials!(trial, 1.0e-30)
+            if _all_finite(trial) && minimum(trial; init=0.0) >= 0.0
+                trial_residual = _backward_euler_residual(network, trial, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+                trial_residual_norm = _max_abs(trial_residual)
+                if trial_residual_norm < best_residual_norm
+                    best_trial = trial
+                    best_residual = trial_residual
+                    best_residual_norm = trial_residual_norm
+                end
+                if trial_residual_norm < residual_norm || trial_residual_norm <= tolerance
+                    Y_next = trial
+                    residual = trial_residual
+                    accepted_trial = true
+                    break
+                end
+            end
+            alpha *= 0.5
+        end
+
+        if !accepted_trial
+            if best_residual_norm < residual_norm
+                Y_next = best_trial
+                residual = best_residual
+            else
+                Y_next .+= correction
+                residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+            end
+        end
+
         tolerance = Float64(newton_tolerance) * max(_max_abs(Y_next), 1.0)
         if _max_abs(residual) <= tolerance || _max_abs(correction) <= tolerance
             newton_iterations !== nothing && push!(newton_iterations, iteration)

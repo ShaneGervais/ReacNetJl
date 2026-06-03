@@ -38,6 +38,18 @@ end
     @test reactants == ["n13"]
     @test products == ["c13"]
 
+    reactants, products = parse_reaction_label("3He(3He,2p)4He")
+    @test reactants == ["he3", "he3"]
+    @test products == ["p", "p", "he4"]
+
+    reactants, products = parse_reaction_label("8B(β+)2α")
+    @test reactants == ["b8"]
+    @test products == ["he4", "he4"]
+
+    reactants, products = parse_reaction_label("p(p,eν)d")
+    @test reactants == ["p", "p"]
+    @test products == ["d"]
+
     @test_throws ArgumentError parse_reaction_label("not a reaction")
 end
 
@@ -53,6 +65,9 @@ end
     @test profiles.rho(1.0) == 1.0e4
     @test profiles.T9(0.35) ≈ 0.16
     @test profiles.rho(0.35) ≈ 2750.0
+    @test first_cooling_threshold_time(trajectory, 0.20) ≈ 1.95
+    @test first_cooling_threshold_time(trajectory, 0.05) === nothing
+    @test_throws ArgumentError first_cooling_threshold_time(trajectory, 0.0)
     @test_throws ArgumentError profiles.T9(-0.1)
 
     metadata_path = tempname()
@@ -260,7 +275,7 @@ end
     @test_throws ArgumentError total_mass_fraction(network, [0.7])
 
     Y0 = [0.7, 1.0e-5, 0.0, 0.0]
-    @test reaction_string(reaction) == "f18(p,he4)o15"
+    @test reaction_string(reaction) == "18F(p,α)15O"
 
     fluxes = reaction_fluxes(network, Y0, 1000.0, 0.5)
     @test length(fluxes) == 1
@@ -293,8 +308,8 @@ end
 
     edges = reaction_edges(network)
     @test length(edges) == 4
-    @test (reaction_index=1, reaction="f18(p,he4)o15", from="f18", to="o15") in edges
-    @test (reaction_index=1, reaction="f18(p,he4)o15", from="p", to="he4") in edges
+    @test (reaction_index=1, reaction="18F(p,α)15O", from="f18", to="o15") in edges
+    @test (reaction_index=1, reaction="18F(p,α)15O", from="p", to="he4") in edges
 
     conservation = reaction_conservation(reaction)
     @test conservation.conserves_A
@@ -315,7 +330,7 @@ end
         [1.0, 1.0],
     )
     decay = Reaction(decay_table)
-    @test reaction_string(decay) == "o15(β+)n15"
+    @test reaction_string(decay) == "15O(β+)15N"
     decay_conservation = reaction_conservation(decay)
     @test decay_conservation.conserves_A
     @test !decay_conservation.conserves_Z
@@ -323,6 +338,34 @@ end
     @test decay_conservation.valid_nuclear_bookkeeping
     decay_network = ReactionNetwork(["o15", "n15"], [decay])
     @test network_validation_report(decay_network).valid
+
+    b8_decay_table = ReactionRateTable(
+        2,
+        ["b8"],
+        ["he4", "he4"],
+        "testw",
+        0.0,
+        [0.1, 1.0],
+        [0.1, 0.1],
+        [1.0, 1.0],
+    )
+    b8_decay = Reaction(b8_decay_table)
+    @test reaction_string(b8_decay) == "8B(β+)2α"
+    @test reaction_conservation(b8_decay).valid_nuclear_bookkeeping
+
+    pp_table = ReactionRateTable(
+        4,
+        ["p", "p"],
+        ["d"],
+        "nacr",
+        1.442,
+        [0.1, 1.0],
+        [1.0e-20, 1.0e-20],
+        [1.0, 1.0],
+    )
+    pp_reaction = Reaction(pp_table)
+    @test reaction_string(pp_reaction) == "p(p,eν)d"
+    @test reaction_conservation(pp_reaction).valid_nuclear_bookkeeping
 
     validation = network_validation_report(network)
     @test validation.valid
@@ -358,6 +401,15 @@ end
     @test size(history) == (length(times), length(Y0))
     @test history[end, network.species_index["f18"]] < Y0[network.species_index["f18"]]
     @test history[end, network.species_index["o15"]] > Y0[network.species_index["o15"]]
+    f18_initial_X = mass_fraction_from_abundance(Y0[network.species_index["f18"]], 18)
+    f18_final_X = mass_fraction_from_abundance(history[end, network.species_index["f18"]], 18)
+    f18_threshold = 0.5 * (f18_initial_X + f18_final_X)
+    crossing = first_mass_fraction_threshold_crossing(network, times, history, "f18", f18_threshold)
+    @test crossing !== nothing
+    @test first(times) < crossing.time < last(times)
+    @test mass_fraction_from_abundance(crossing.state[network.species_index["f18"]], 18) ≈ f18_threshold
+    @test first_mass_fraction_threshold_crossing(network, times, history, "f18", f18_final_X / 2) === nothing
+    @test_throws ArgumentError first_mass_fraction_threshold_crossing(network, times, history, "missing", f18_threshold)
 
     flux_history = reaction_flux_history(network, history, times, 1000.0, 0.5)
     @test size(flux_history) == (length(times), length(network.reactions))
@@ -488,7 +540,7 @@ end
 @testset "read synthetic STARLIB table" begin
     path = tempname()
     open(path, "w") do io
-        println(io, "2 p f18 ne19 testsource 3.529")
+        println(io, "4 p f18 ne19 testsource 3.529")
         for i in 1:60
             T9 = 0.01 * i
             rate = 1.0e-12 * i
@@ -502,7 +554,7 @@ end
 
     @test length(tables) == 1
     table = only(tables)
-    @test table.chapter == 2
+    @test table.chapter == 4
     @test table.reactants == ["p", "f18"]
     @test table.products == ["ne19"]
     @test table.source == "testsource"
@@ -537,6 +589,42 @@ end
     @test reaction_from_label(duplicate_tables, "18F(p,γ)19Ne"; on_multiple=:first).rate_table == table
     @test_throws ArgumentError reaction_from_label(tables, "18F(p,α)15O")
 
+    multiproduct_path = tempname()
+    open(multiproduct_path, "w") do io
+        println(io, "2 b8 he4 he4 weaksrcw 18.0717")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 0.1, " ", 1.0)
+        end
+        println(io, "6 he3 he3 p p he4 il16 12.8596")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 0.2, " ", 1.0)
+        end
+        println(io, "8 he4 he4 he4 c12 nacr 7.27475")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 0.3, " ", 1.0)
+        end
+        println(io, "4 p p d nacr 1.44222")
+        for i in 1:60
+            println(io, 0.01 * i, " ", 1.0e-20, " ", 1.0)
+        end
+    end
+    multiproduct_tables = read_starlib(multiproduct_path)
+    rm(multiproduct_path; force=true)
+    @test multiproduct_tables[1].reactants == ["b8"]
+    @test multiproduct_tables[1].products == ["he4", "he4"]
+    @test multiproduct_tables[2].reactants == ["he3", "he3"]
+    @test multiproduct_tables[2].products == ["p", "p", "he4"]
+    @test multiproduct_tables[3].reactants == ["he4", "he4", "he4"]
+    @test multiproduct_tables[3].products == ["c12"]
+    @test multiproduct_tables[4].reactants == ["p", "p"]
+    @test multiproduct_tables[4].products == ["d"]
+    @test network_validation_report(network_from_tables(multiproduct_tables); throw_on_error=true).valid
+    @test find_rate(multiproduct_tables, "8B(β+)2α") == [multiproduct_tables[1]]
+    @test find_rate(multiproduct_tables, "3He(3He,2p)4He") == [multiproduct_tables[2]]
+    @test find_rate(multiproduct_tables, "p(p,eν)d") == [multiproduct_tables[4]]
+    selected_multiproduct_h_ca = select_h_ca_reaction_tables(multiproduct_tables, ["b8"])
+    @test multiproduct_tables[1] in selected_multiproduct_h_ca
+
     al_path = tempname()
     open(al_path, "w") do io
         println(io, "4 p al*6 si27 isomer 7.69126")
@@ -553,6 +641,39 @@ end
     reverse_table = ReactionRateTable(2, ["ne19"], ["p", "f18"], "reverse", -3.529, table.T9, table.rate, table.factor_uncertainty)
     reverse_matches = find_reverse_rate([table, reverse_table], "18F(p,γ)19Ne")
     @test reverse_matches == [reverse_table]
+    @test normalize_species_name("al-6") == "al26"
+
+    generated_reverse = generated_detailed_balance_reverse_table(table)
+    @test generated_reverse.reactants == ["ne19"]
+    @test generated_reverse.products == ["p", "f18"]
+    @test generated_reverse.q_value == -table.q_value
+    @test all(>(0.0), generated_reverse.rate)
+
+    reverse_summary = add_reverse_reaction_tables([table, reverse_table], [table])
+    @test reverse_summary.explicit == 1
+    @test reverse_summary.generated == 0
+    @test length(reverse_summary.tables) == 2
+
+    generated_summary = add_reverse_reaction_tables([table], [table])
+    @test generated_summary.explicit == 0
+    @test generated_summary.generated == 1
+    @test length(generated_summary.tables) == 2
+    generated_network = network_from_tables(generated_summary.tables)
+    @test length(generated_network.reactions) == 2
+
+    decay_result = decay_mass_fractions(multiproduct_tables, Dict("b8" => 8.0e-8), 10.0)
+    @test length(decay_result.decay_tables) == 1
+    @test get(decay_result.mass_fractions, "b8", 0.0) < 8.0e-8
+    @test get(decay_result.mass_fractions, "he4", 0.0) > 0.0
+
+    long_decay_result = decay_mass_fractions(multiproduct_tables, Dict("b8" => 8.0e-8), 3600.0)
+    @test long_decay_result.times == [0.0, 3600.0]
+    @test get(long_decay_result.mass_fractions, "b8", 0.0) < 1.0e-30
+    @test sum(values(long_decay_result.mass_fractions); init=0.0) ≈ 8.0e-8 rtol=1.0e-10
+
+    selected_h_ca = select_h_ca_reaction_tables(tables, ["p", "f18"])
+    @test !isempty(selected_h_ca)
+    @test any(t -> t.reactants == ["p", "f18"] && t.products == ["ne19"], selected_h_ca)
 
     result = solve_single_zone(
         tables,
@@ -579,7 +700,7 @@ end
 
     unsupported_path = tempname()
     open(unsupported_path, "w") do io
-        println(io, "9 p f18 he4 o15 ne19 unsupported 0.0")
+        println(io, "11 p f18 he4 o15 ne19 unsupported 0.0")
         for i in 1:60
             println(io, 0.01 * i, " ", 1.0e-12 * i, " ", 2.0)
         end
@@ -591,6 +712,6 @@ end
     @test unsupported_report.total == 1
     @test unsupported_report.supported == 0
     @test unsupported_report.unsupported == 1
-    @test unsupported_report.unsupported_by_chapter[9] == 1
+    @test unsupported_report.unsupported_by_chapter[11] == 1
     @test isempty(only(unsupported_tables).products)
 end
