@@ -2,10 +2,12 @@ module ReacNetJl
 
 using LinearAlgebra
 using Random
+using PrecompileTools: @setup_workload, @compile_workload
 
 export Species,
     Trajectory,
     ReactionRateTable,
+    ReaclibSet,
     Reaction,
     ReactionNetwork,
     species_from_name,
@@ -14,6 +16,16 @@ export Species,
     normalize_species_name,
     parse_reaction_label,
     read_starlib,
+    read_reaclib,
+    read_winvne,
+    read_tabulated_rates,
+    read_iliadis2001_rates,
+    read_nacre_rates,
+    reaction_q_value,
+    PartitionFunctionTable,
+    reaclib_rate,
+    reaclib_rate_tables,
+    iliadis2002_rate_tables,
     read_trajectory,
     read_initial_abundances,
     trajectory_profiles,
@@ -31,6 +43,7 @@ export Species,
     network_from_tables,
     network_from_labels,
     weak_screening_multiplier,
+    chugunov_screening_multiplier,
     abundances_from_mass_fractions,
     mass_fractions_from_abundances,
     mass_fraction_history,
@@ -56,41 +69,43 @@ export Species,
     network_rhs,
     solve_network,
     solve_network_adaptive,
+    solve_network_fbdf,
     run_monte_carlo,
-    solve_single_zone
+    solve_single_zone,
+    run_ppn
 
-#=
+"""
     Species
 
 A nuclear species identified by charge number `Z`, mass number `A`, and a display
 `name`, such as `Species("f18", 9, 18)`.
-=#
+"""
 struct Species
     name::String
     Z::Int
     A::Int
 end
 
-#=
+"""
     Trajectory
 
 A single-zone thermodynamic trajectory with time in seconds, temperature `T9` in
 GK, and density `rho` in g cm^-3.
-=#
+"""
 struct Trajectory
     time::Vector{Float64}
     T9::Vector{Float64}
     rho::Vector{Float64}
 end
 
-#=
+"""
     ReactionRateTable
 
 A temperature-dependent thermonuclear reaction rate from STARLIB.
 
 `T9` is the temperature grid in GK. `rate` is the recommended STARLIB rate.
 `factor_uncertainty` is the STARLIB multiplicative factor uncertainty.
-=#
+"""
 struct ReactionRateTable
     chapter::Int
     reactants::Vector{String}
@@ -102,7 +117,7 @@ struct ReactionRateTable
     factor_uncertainty::Vector{Float64}
 end
 
-#=
+"""
     Reaction
 
 A network reaction built from a `ReactionRateTable`.
@@ -110,7 +125,7 @@ A network reaction built from a `ReactionRateTable`.
 The first version stores only the reaction participants and a STARLIB rate table.
 Later we can add screening, reverse-rate handling, and uncertainty sampling here
 without changing the network RHS interface.
-=#
+"""
 struct Reaction
     reactants::Vector{String}
     products::Vector{String}
@@ -129,9 +144,17 @@ struct CompiledReaction
     stoichiometric_delta::Vector{Float64}
     symmetry_factor::Float64
     nreactants::Int
+    # Sum of Zi*Zj over charged reactant pairs, precomputed so weak screening
+    # needs no species parsing in the solver hot loop.
+    charge_pair_sum::Float64
+    # Chained (Z1, A1, Z2, A2) screening pairs: one pair for two-body
+    # reactions, and sequential compound pairs for three-body reactions
+    # (e.g. triple-alpha screens he4+he4, then be8+he4). Pairs involving a
+    # neutral particle are omitted.
+    screening_pairs::Vector{NTuple{4,Float64}}
 end
 
-#=
+"""
     ReactionNetwork
 
 A single-zone nuclear reaction network.
@@ -139,7 +162,7 @@ A single-zone nuclear reaction network.
 `species` fixes the order of the abundance vector `Y`. `species_index` maps each
 species name to its position in `Y`, and `reactions` stores the reactions that
 contribute to `dY/dt`.
-=#
+"""
 struct ReactionNetwork
     species::Vector{String}
     species_info::Vector{Species}
@@ -171,8 +194,27 @@ function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::A
     return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions, compiled_reactions)
 end
 
-const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "./starlib.dat")
+const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "data", "starlib.dat")
+const LEGACY_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib.dat")
+const DEFAULT_REACLIB_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_v1.0.dat")
+const DEFAULT_REACLIB_IL01_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_il01.dat")
+const DEFAULT_REACLIB_NACR_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_nacr.dat")
+const DEFAULT_ILIADIS2001_PATH = joinpath(dirname(@__DIR__), "data", "iliadis2001_rates.dat")
+const DEFAULT_NACRE_PATH = joinpath(dirname(@__DIR__), "data", "nacre_rates.dat")
 const STARLIB_ROWS_PER_REACTION = 60
+
+function _default_starlib_path()
+    isfile(DEFAULT_STARLIB_PATH) && return DEFAULT_STARLIB_PATH
+    isfile(LEGACY_STARLIB_PATH) && return LEGACY_STARLIB_PATH
+    return DEFAULT_STARLIB_PATH
+end
+
+function _default_reaclib_path()
+    isfile(DEFAULT_REACLIB_PATH) || error(
+        "REACLIB library not found at $(DEFAULT_REACLIB_PATH); run data/download_rates.sh to fetch it",
+    )
+    return DEFAULT_REACLIB_PATH
+end
 const AVOGADRO = 6.02214076e23
 const MEV_TO_ERG = 1.602176634e-6
 
@@ -218,7 +260,7 @@ const _ELEMENT_SYMBOLS = [
 
 const _ELEMENT_Z = Dict(symbol => Z for (Z, symbol) in pairs(_ELEMENT_SYMBOLS))
 
-#=
+"""
     normalize_species_name(name)
 
 Normalize common isotope notation to STARLIB-style lowercase names.
@@ -228,7 +270,7 @@ Examples:
 - `"4He" -> "he4"`
 - `"α" -> "he4"`
 - `"γ" -> "gamma"`
-=#
+"""
 function normalize_species_name(name::AbstractString)
     raw = lowercase(strip(name))
     raw == "al-6" && return "al26"
@@ -267,7 +309,7 @@ function normalize_species_name(name::AbstractString)
     return s
 end
 
-#=
+"""
     species_from_name(name)
 
 Create a `Species` object from a normalized or common isotope name.
@@ -276,7 +318,7 @@ Examples:
 - `species_from_name("18F") == Species("f18", 9, 18)`
 - `species_from_name("he4") == Species("he4", 2, 4)`
 - `species_from_name("p") == Species("p", 1, 1)`
-=#
+"""
 function species_from_name(name::AbstractString)
     normalized = normalize_species_name(name)
 
@@ -671,13 +713,13 @@ function _valid_nuclear_bookkeeping(table::ReactionRateTable)
     end
 end
 
-#=
+"""
     starlib_chapter_report(tables)
 
 Summarize which STARLIB chapter layouts were parsed into supported reactant and
 product bookkeeping. Unsupported rows are kept by `read_starlib`, but they are
 not suitable for network construction until their chapter layout is implemented.
-=#
+"""
 function starlib_chapter_report(tables::AbstractVector{ReactionRateTable})
     supported_by_chapter = Dict{Int,Int}()
     unsupported_by_chapter = Dict{Int,Int}()
@@ -894,7 +936,7 @@ function first_cooling_threshold_time(trajectory::Trajectory, threshold_T9::Real
     return nothing
 end
 
-function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH; warn_unsupported::Bool=false)
+function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsupported::Bool=false)
     tables = ReactionRateTable[]
     unsupported_counts = Dict{Int,Int}()
 
@@ -947,12 +989,469 @@ function read_starlib(path::AbstractString=DEFAULT_STARLIB_PATH; warn_unsupporte
     return tables
 end
 
+"""
+    ReaclibSet
+
+One REACLIB fit set: a single 7-coefficient term of a reaction rate. A REACLIB
+rate is the sum of all sets sharing the same reaction and set label, e.g. a
+non-resonant plus one or more resonant terms.
+
+`resonance` is the REACLIB flag character (' ' or 'n' non-resonant, 'r'
+resonant, 'w' weak). `reverse` marks detailed-balance reverse fits ('v' flag),
+which REACLIB derives without partition functions.
+"""
+struct ReaclibSet
+    chapter::Int
+    reactants::Vector{String}
+    products::Vector{String}
+    label::String
+    resonance::Char
+    reverse::Bool
+    q_value::Float64
+    coefficients::NTuple{7,Float64}
+end
+
+# REACLIB2 chapter layouts (reactants, products). Chapters 1-8 match STARLIB;
+# REACLIB2 additionally defines 9-11.
+const _REACLIB_ARITIES = Dict(
+    1 => (1, 1),
+    2 => (1, 2),
+    3 => (1, 3),
+    4 => (2, 1),
+    5 => (2, 2),
+    6 => (2, 3),
+    7 => (2, 4),
+    8 => (3, 1),
+    9 => (3, 2),
+    10 => (4, 2),
+    11 => (1, 4),
+)
+
+# The standard STARLIB 60-point temperature grid in GK. REACLIB analytic fits
+# are evaluated onto this grid so REACLIB-derived tables interpolate exactly
+# like STARLIB tables.
+const STARLIB_T9_GRID = [
+    1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3, 6.0e-3, 7.0e-3, 8.0e-3, 9.0e-3, 1.0e-2,
+    1.1e-2, 1.2e-2, 1.3e-2, 1.4e-2, 1.5e-2, 1.6e-2, 1.8e-2, 2.0e-2, 2.5e-2, 3.0e-2,
+    4.0e-2, 5.0e-2, 6.0e-2, 7.0e-2, 8.0e-2, 9.0e-2, 1.0e-1, 1.1e-1, 1.2e-1, 1.3e-1,
+    1.4e-1, 1.5e-1, 1.6e-1, 1.8e-1, 2.0e-1, 2.5e-1, 3.0e-1, 3.5e-1, 4.0e-1, 4.5e-1,
+    5.0e-1, 6.0e-1, 7.0e-1, 8.0e-1, 9.0e-1, 1.0e0, 1.25e0, 1.5e0, 1.75e0, 2.0e0,
+    2.5e0, 3.0e0, 3.5e0, 4.0e0, 5.0e0, 6.0e0, 7.0e0, 8.0e0, 9.0e0, 1.0e1,
+]
+
+# Cap on the REACLIB fit exponent so pathological extrapolation outside a fit's
+# validity range yields a large finite rate instead of Inf.
+const REACLIB_EXPONENT_CAP = 500.0
+
+function _parse_reaclib_float(field::AbstractString)
+    s = strip(field)
+    isempty(s) && return 0.0
+    return parse(Float64, s)
+end
+
+"""
+    read_reaclib(path=DEFAULT_REACLIB_PATH)
+
+Read a JINA REACLIB library (Reaclib1 or Reaclib2 layout) into `ReaclibSet`
+entries. Every fit set is kept, including alternate set labels for the same
+reaction and detailed-balance reverse fits; use `reaclib_rate_tables` or
+`iliadis2002_rate_tables` to select and evaluate them.
+"""
+function read_reaclib(path::AbstractString=_default_reaclib_path())
+    sets = ReaclibSet[]
+    open(path, "r") do io
+        chapter = 0
+        line_number = 0
+        while !eof(io)
+            line = readline(io)
+            line_number += 1
+            stripped = strip(line)
+            isempty(stripped) && continue
+
+            if occursin(r"^\d+$", stripped)
+                chapter = parse(Int, stripped)
+                haskey(_REACLIB_ARITIES, chapter) || error("Unsupported REACLIB chapter $chapter at line $line_number of $path")
+                continue
+            end
+
+            chapter >= 1 || error("REACLIB set header before any chapter marker at line $line_number of $path")
+            header = rpad(line, 74)
+            raw_species = [strip(header[(6 + 5 * i):(10 + 5 * i)]) for i in 0:5]
+            label = strip(header[44:47])
+            resonance = header[48]
+            reverse = header[49] == 'v'
+            q_value = _parse_reaclib_float(header[53:64])
+
+            eof(io) && error("Unexpected end of file after REACLIB header at line $line_number of $path")
+            first_coefficients = rpad(readline(io), 52)
+            line_number += 1
+            eof(io) && error("Unexpected end of file inside REACLIB set at line $line_number of $path")
+            second_coefficients = rpad(readline(io), 39)
+            line_number += 1
+
+            coefficients = (
+                _parse_reaclib_float(first_coefficients[1:13]),
+                _parse_reaclib_float(first_coefficients[14:26]),
+                _parse_reaclib_float(first_coefficients[27:39]),
+                _parse_reaclib_float(first_coefficients[40:52]),
+                _parse_reaclib_float(second_coefficients[1:13]),
+                _parse_reaclib_float(second_coefficients[14:26]),
+                _parse_reaclib_float(second_coefficients[27:39]),
+            )
+
+            nreactants, nproducts = _REACLIB_ARITIES[chapter]
+            species = [normalize_species_name(s) for s in raw_species if !isempty(s)]
+            length(species) == nreactants + nproducts ||
+                error("REACLIB chapter $chapter set at line $(line_number - 2) of $path has $(length(species)) species, expected $(nreactants + nproducts)")
+
+            push!(sets, ReaclibSet(
+                chapter,
+                species[1:nreactants],
+                species[(nreactants + 1):end],
+                label,
+                resonance,
+                reverse,
+                q_value,
+                coefficients,
+            ))
+        end
+    end
+    return sets
+end
+
+"""
+    reaclib_rate(set, T9)
+    reaclib_rate(sets, T9)
+
+Evaluate the REACLIB analytic rate parameterization
+
+    rate = exp(a1 + a2/T9 + a3*T9^(-1/3) + a4*T9^(1/3) + a5*T9 + a6*T9^(5/3) + a7*ln(T9))
+
+for one fit set, or the sum over a vector of sets belonging to one reaction.
+"""
+function reaclib_rate(set::ReaclibSet, T9::Real)
+    T = Float64(T9)
+    T > 0.0 || throw(ArgumentError("T9 must be positive"))
+    T13 = cbrt(T)
+    a = set.coefficients
+    exponent = a[1] + a[2] / T + a[3] / T13 + a[4] * T13 + a[5] * T + a[6] * T * T13 * T13 + a[7] * log(T)
+    return exp(min(exponent, REACLIB_EXPONENT_CAP))
+end
+
+function reaclib_rate(sets::AbstractVector{ReaclibSet}, T9::Real)
+    isempty(sets) && throw(ArgumentError("cannot evaluate an empty set of REACLIB fits"))
+    return sum(reaclib_rate(set, T9) for set in sets)
+end
+
+_reaclib_group_key(set::ReaclibSet) = (set.chapter, Tuple(set.reactants), Tuple(set.products), lowercase(set.label), set.reverse)
+
 #=
+Build one `ReactionRateTable` from the fit sets of a single reaction/label
+group. The source string follows the STARLIB convention of label plus flag
+suffixes, e.g. `"nacr"`, `"wc12w"`, `"nacrv"`, so weak-rate and source
+handling downstream behaves identically for STARLIB and REACLIB tables.
+REACLIB carries no rate uncertainties, so the factor uncertainty is 1.
+=#
+function _reaclib_group_table(sets::AbstractVector{ReaclibSet}, T9_grid::AbstractVector{<:Real})
+    representative = first(sets)
+    grid = Float64.(collect(T9_grid))
+    rate = Float64[max(reaclib_rate(sets, T9), LOG_INTERPOLATION_FLOOR) for T9 in grid]
+    weak = any(set -> set.resonance == 'w', sets)
+    source = representative.label * (weak ? "w" : "") * (representative.reverse ? "v" : "")
+
+    return ReactionRateTable(
+        representative.chapter,
+        copy(representative.reactants),
+        copy(representative.products),
+        source,
+        representative.q_value,
+        grid,
+        rate,
+        ones(Float64, length(grid)),
+    )
+end
+
+_reaclib_set_fingerprint(set::ReaclibSet) =
+    (_reaclib_group_key(set), set.resonance, set.q_value, set.coefficients)
+
+#=
+Drop exact duplicate fit sets while keeping file order. Needed because the
+label-specific REACLIB downloads (`data/reaclib_il01.dat`,
+`data/reaclib_nacr.dat`) overlap with the sets a library snapshot already
+contains; summing a duplicated set would double the rate.
+=#
+function _dedup_reaclib_sets(sets::AbstractVector{ReaclibSet})
+    seen = Set{Any}()
+    unique_sets = ReaclibSet[]
+    for set in sets
+        fingerprint = _reaclib_set_fingerprint(set)
+        fingerprint in seen && continue
+        push!(seen, fingerprint)
+        push!(unique_sets, set)
+    end
+    return unique_sets
+end
+
+function _group_reaclib_sets(sets::AbstractVector{ReaclibSet}, keep::Function)
+    order = Any[]
+    groups = Dict{Any,Vector{ReaclibSet}}()
+    for set in _dedup_reaclib_sets(sets)
+        keep(set) || continue
+        key = _reaclib_group_key(set)
+        if !haskey(groups, key)
+            groups[key] = ReaclibSet[]
+            push!(order, key)
+        end
+        push!(groups[key], set)
+    end
+    return order, groups
+end
+
+"""
+    reaclib_rate_tables(sets; T9_grid=STARLIB_T9_GRID, labels=nothing, include_reverse=false)
+
+Evaluate REACLIB fit sets into `ReactionRateTable` entries on a temperature
+grid. Sets are grouped by reaction and set label, and all sets of a group
+(non-resonant plus resonant terms) are summed. `labels` restricts the output
+to specific set labels, e.g. `["nacr", "il01"]`. Detailed-balance reverse
+fits are excluded unless `include_reverse=true`.
+"""
+function reaclib_rate_tables(
+    sets::AbstractVector{ReaclibSet};
+    T9_grid::AbstractVector{<:Real}=STARLIB_T9_GRID,
+    labels=nothing,
+    include_reverse::Bool=false,
+)
+    wanted = labels === nothing ? nothing : Set(lowercase(strip(String(label))) for label in labels)
+    keep(set) = (include_reverse || !set.reverse) && (wanted === nothing || lowercase(set.label) in wanted)
+    order, groups = _group_reaclib_sets(sets, keep)
+    return [_reaclib_group_table(groups[key], T9_grid) for key in order]
+end
+
+_reaction_display(reactants::AbstractVector{String}, products::AbstractVector{String}) =
+    join(reactants, "+") * " -> " * join(products, "+")
+
+"""
+    iliadis2002_rate_tables(sets; T9_grid=STARLIB_T9_GRID, boundary_A=20,
+                            include_weak=true, include_reverse=false)
+
+Build the baseline rate tables of the Iliadis et al. (2002, ApJS 142, 105)
+nova sensitivity study from a REACLIB library:
+
+- NACRE (`nacr`, Angulo et al. 1999) for reactions whose heaviest reactant has
+  A < `boundary_A`
+- Iliadis et al. (2001, ApJS 134, 151; `il01`) for A >= `boundary_A`, with
+  `nacr` as fallback
+
+Weak rates, which are outside both compilations, are kept from whatever set
+label the library provides when `include_weak=true`. Reactions covered by
+neither compilation fall back to their available label and are reported in
+`report.fallbacks` so rate provenance stays explicit.
+
+Returns `(tables=..., report=...)` where `report` carries per-reaction chosen
+sources (`chosen`), counts by category (`counts`), and the fallback list.
+Use `read_reaclib` on the ReaclibV1.0 snapshot (`data/reaclib_v1.0.dat`),
+which still contains the complete `nacr` and `il01` sets.
+"""
+function iliadis2002_rate_tables(
+    sets::AbstractVector{ReaclibSet};
+    T9_grid::AbstractVector{<:Real}=STARLIB_T9_GRID,
+    boundary_A::Int=20,
+    include_weak::Bool=true,
+    include_reverse::Bool=false,
+    paper_tables::AbstractVector{ReactionRateTable}=ReactionRateTable[],
+)
+    deduped_sets = _dedup_reaclib_sets(sets)
+    reaction_order = Any[]
+    by_reaction = Dict{Any,Dict{String,Vector{ReaclibSet}}}()
+    for set in deduped_sets
+        set.reverse && continue
+        key = (set.chapter, Tuple(set.reactants), Tuple(set.products))
+        if !haskey(by_reaction, key)
+            by_reaction[key] = Dict{String,Vector{ReaclibSet}}()
+            push!(reaction_order, key)
+        end
+        label_map = by_reaction[key]
+        label = lowercase(set.label)
+        haskey(label_map, label) || (label_map[label] = ReaclibSet[])
+        push!(label_map[label], set)
+    end
+
+    tables = ReactionRateTable[]
+    chosen = NamedTuple[]
+    counts = Dict{Symbol,Int}()
+    chosen_forward_labels = Dict{Any,String}()
+
+    for key in reaction_order
+        chapter, reactants, products = key
+        label_map = by_reaction[key]
+        available = sort!(collect(keys(label_map)))
+
+        target_A = 0
+        for name in reactants
+            species = try
+                species_from_name(name)
+            catch
+                continue
+            end
+            target_A = max(target_A, species.A)
+        end
+
+        preferred = target_A >= boundary_A ? ("il01", "nacr") : ("nacr", "il01")
+        label = nothing
+        category = :other
+        for wanted in preferred
+            if wanted in available
+                label = wanted
+                category = wanted == "il01" ? :il01 : :nacr
+                break
+            end
+        end
+
+        if label === nothing
+            weak_labels = [l for l in available if any(set -> set.resonance == 'w', label_map[l]) || _weak_source(l)]
+            if !isempty(weak_labels)
+                label = first(weak_labels)
+                category = :weak
+            else
+                label = first(available)
+                category = :other
+            end
+        end
+
+        category == :weak && !include_weak && continue
+
+        table = _reaclib_group_table(label_map[label], T9_grid)
+        push!(tables, table)
+        counts[category] = get(counts, category, 0) + 1
+        chosen_forward_labels[(Tuple(reactants), Tuple(products))] = label
+        push!(chosen, (
+            reaction=_reaction_display(table.reactants, table.products),
+            chapter=chapter,
+            target_A=target_A,
+            preferred=first(preferred),
+            label=label,
+            source=table.source,
+            category=category,
+            available=available,
+        ))
+    end
+
+    if include_reverse
+        keep(set) = set.reverse
+        order, groups = _group_reaclib_sets(deduped_sets, keep)
+        for key in order
+            group = groups[key]
+            representative = first(group)
+            forward_key = (Tuple(representative.products), Tuple(representative.reactants))
+            get(chosen_forward_labels, forward_key, nothing) == lowercase(representative.label) || continue
+
+            table = _reaclib_group_table(group, T9_grid)
+            push!(tables, table)
+            counts[:reverse] = get(counts, :reverse, 0) + 1
+            push!(chosen, (
+                reaction=_reaction_display(table.reactants, table.products),
+                chapter=representative.chapter,
+                target_A=0,
+                preferred=lowercase(representative.label),
+                label=lowercase(representative.label),
+                source=table.source,
+                category=:reverse,
+                available=[lowercase(representative.label)],
+            ))
+        end
+    end
+
+    # Paper tables (tabulated rates from the original publications) override
+    # the REACLIB fits of the same reactions; reactions absent from REACLIB
+    # are appended. This closes the compilation-coverage gap of the JINA
+    # database with the authoritative published numbers.
+    replaced = 0
+    added = 0
+    if !isempty(paper_tables)
+        index_by_participants = Dict{Any,Int}(_reaction_participant_key(t) => i for (i, t) in pairs(tables))
+        paper_slots = Set{Int}()
+        for paper_table in paper_tables
+            key = _reaction_participant_key(paper_table)
+            slot = get(index_by_participants, key, nothing)
+            if slot === nothing
+                push!(tables, paper_table)
+                slot = length(tables)
+                index_by_participants[key] = slot
+                push!(paper_slots, slot)
+                added += 1
+            elseif slot in paper_slots
+                # first paper table wins: il01 keeps proton-induced A>=20
+                # reactions that NACRE also tabulates
+                continue
+            else
+                tables[slot] = paper_table
+                push!(paper_slots, slot)
+                replaced += 1
+            end
+
+            target_A = 0
+            for name in paper_table.reactants
+                species = try
+                    species_from_name(name)
+                catch
+                    continue
+                end
+                target_A = max(target_A, species.A)
+            end
+            push!(chosen, (
+                reaction=_reaction_display(paper_table.reactants, paper_table.products),
+                chapter=paper_table.chapter,
+                target_A=target_A,
+                preferred=paper_table.source,
+                label=paper_table.source,
+                source=paper_table.source,
+                category=:paper,
+                available=[paper_table.source],
+            ))
+        end
+        counts[:paper] = replaced + added
+    end
+
+    fallbacks = [entry for entry in chosen if entry.category == :other]
+    report = (counts=counts, chosen=chosen, fallbacks=fallbacks, paper_overrides=(replaced=replaced, added=added))
+    return (tables=tables, report=report)
+end
+
+function iliadis2002_rate_tables(path::AbstractString; kwargs...)
+    return iliadis2002_rate_tables(read_reaclib(path); kwargs...)
+end
+
+"""
+The zero-argument form reads the ReaclibV1.0 snapshot for library-wide
+coverage (weak rates, neutron captures, and other channels outside the two
+compilations), merges in the complete label-specific `nacr` and `il01`
+downloads, and overrides with the tabulated paper rates
+(`data/iliadis2001_rates.dat`, `data/nacre_rates.dat`) when those files are
+present in `data/`.
+"""
+function iliadis2002_rate_tables(; kwargs...)
+    sets = read_reaclib(_default_reaclib_path())
+    for path in (DEFAULT_REACLIB_IL01_PATH, DEFAULT_REACLIB_NACR_PATH)
+        isfile(path) && append!(sets, read_reaclib(path))
+    end
+
+    if !haskey(kwargs, :paper_tables)
+        pf = isfile(DEFAULT_WINVNE_PATH) ? read_winvne() : nothing
+        paper = ReactionRateTable[]
+        isfile(DEFAULT_ILIADIS2001_PATH) && append!(paper, read_iliadis2001_rates(; partition_functions=pf))
+        isfile(DEFAULT_NACRE_PATH) && append!(paper, read_nacre_rates(; partition_functions=pf))
+        return iliadis2002_rate_tables(sets; paper_tables=paper, kwargs...)
+    end
+    return iliadis2002_rate_tables(sets; kwargs...)
+end
+
+"""
     find_rate(tables, label; source=nothing)
 
 Find STARLIB rate tables matching a reaction label like `"18F(p,α)15O"`.
 Returns all matching tables because STARLIB can contain multiple sources.
-=#
+"""
 function find_rate(tables::AbstractVector{ReactionRateTable}, label::AbstractString; source=nothing)
     reactants, products = parse_reaction_label(label)
     matches = filter(t -> t.reactants == reactants && t.products == products, tables)
@@ -962,13 +1461,13 @@ function find_rate(tables::AbstractVector{ReactionRateTable}, label::AbstractStr
     return filter(t -> lowercase(t.source) == wanted, matches)
 end
 
-#=
+"""
     find_reverse_rate(tables, label; source=nothing)
 
 Find STARLIB tables whose parsed reactants/products are the exact reverse of a
 reaction label. This detects explicit reverse rates already present in STARLIB;
 it does not synthesize reciprocal-rule reverse rates.
-=#
+"""
 function find_reverse_rate(tables::AbstractVector{ReactionRateTable}, label::AbstractString; source=nothing)
     reactants, products = parse_reaction_label(label)
     matches = filter(t -> t.reactants == products && t.products == reactants, tables)
@@ -1023,27 +1522,301 @@ const DETAILED_BALANCE_Q_FACTOR = 11.605
 const GENERATED_REVERSE_RATE_FLOOR = 1.0e-300
 const LOG_INTERPOLATION_FLOOR = 1.0e-300
 
-#=
-    generated_detailed_balance_reverse_table(table)
+"""
+    PartitionFunctionTable
 
-Generate an approximate detailed-balance reverse table for a radiative-capture
-style two-body forward reaction `a + b -> c`. STARLIB does not include partition
-functions or spin factors in the parsed data, so this intentionally uses the
-standard mass-factor and Boltzmann term only. Prefer explicit STARLIB reverse
-tables when they exist.
+Ground-state statistical weights `g0 = 2J+1`, temperature-dependent
+normalized partition functions `G(T9)`, and mass excesses (MeV) from a JINA
+`winvne` file, keyed by normalized species name. `G` is tabulated on the
+standard 24-point winvn temperature grid and is defined so that the total
+partition function is `g0 * G(T9)`.
+"""
+struct PartitionFunctionTable
+    T9::Vector{Float64}
+    g0::Dict{String,Float64}
+    G::Dict{String,Vector{Float64}}
+    mass_excess::Dict{String,Float64}
+end
+
+const DEFAULT_WINVNE_PATH = joinpath(dirname(@__DIR__), "data", "winvne_v2.0.dat")
+
+const _WINVNE_T9_GRID = [
+    0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5,
+    2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+]
+
+"""
+    read_winvne(path=DEFAULT_WINVNE_PATH)
+
+Read a JINA `winvne` nuclear-data file into a `PartitionFunctionTable`.
+
+The file layout is: a title line, a packed temperature-grid line, a species
+directory, then one record per nuclide consisting of a header line
+`name A Z N spin mass_excess label` followed by 24 partition-function values.
+Records are recognized by their header shape, so the directory needs no
+special handling. If a normalized name appears more than once (for example
+`al-6` normalizing onto `al26`), the first record wins.
+"""
+function read_winvne(path::AbstractString=DEFAULT_WINVNE_PATH)
+    isfile(path) || error("winvne file not found at $path; run data/download_rates.sh to fetch it")
+
+    g0 = Dict{String,Float64}()
+    G = Dict{String,Vector{Float64}}()
+    mass_excess = Dict{String,Float64}()
+
+    open(path, "r") do io
+        line_number = 0
+        while !eof(io)
+            line = readline(io)
+            line_number += 1
+            fields = split(line)
+            length(fields) >= 6 || continue
+
+            spin = tryparse(Float64, fields[5])
+            mass_number = tryparse(Float64, fields[2])
+            excess = tryparse(Float64, fields[6])
+            (spin === nothing || mass_number === nothing) && continue
+
+            name = normalize_species_name(fields[1])
+            values = Float64[]
+            sizehint!(values, length(_WINVNE_T9_GRID))
+            while length(values) < length(_WINVNE_T9_GRID)
+                eof(io) && error("unexpected end of winvne file inside the record of '$name' at line $line_number of $path")
+                row = split(readline(io))
+                line_number += 1
+                for token in row
+                    push!(values, parse(Float64, token))
+                end
+            end
+            length(values) == length(_WINVNE_T9_GRID) ||
+                error("winvne record of '$name' at line $line_number of $path has $(length(values)) partition-function values, expected $(length(_WINVNE_T9_GRID))")
+
+            if !haskey(g0, name)
+                g0[name] = 2.0 * spin + 1.0
+                G[name] = values
+                excess === nothing || (mass_excess[name] = excess)
+            end
+        end
+    end
+
+    return PartitionFunctionTable(copy(_WINVNE_T9_GRID), g0, G, mass_excess)
+end
+
+"""
+    reaction_q_value(pf, reactants, products)
+
+Q-value in MeV from winvne mass excesses: `Q = sum(ME reactants) - sum(ME
+products)`. Returns `nothing` when any participant is missing from the table.
+"""
+function reaction_q_value(pf::PartitionFunctionTable, reactants, products)
+    total = 0.0
+    for name in reactants
+        excess = get(pf.mass_excess, normalize_species_name(name), nothing)
+        excess === nothing && return nothing
+        total += excess
+    end
+    for name in products
+        excess = get(pf.mass_excess, normalize_species_name(name), nothing)
+        excess === nothing && return nothing
+        total -= excess
+    end
+    return total
+end
+
+"""
+    read_tabulated_rates(path; source, partition_functions=nothing,
+                         include_total_variants=false)
+
+Read a ReacNetJl tabulated-rate file (as produced by the paper-table
+extraction scripts) into `ReactionRateTable` entries. The format is blocks of
+
+    reaction: p ne20 -> na21 ; label: 20Ne(p,g) ; table: 3 ; variant: standard
+    <T9> <rate>
+    ...
+    end
+
+Q-values are computed from winvne mass excesses when `partition_functions`
+is given (0 otherwise, which disables generated detailed-balance reverses
+for those tables). Rates with `variant: total` duplicate the sum of their
+ground/isomer siblings and are skipped unless `include_total_variants=true`.
+
+Rows may carry two columns (`T9 rate`) or four (`T9 rate lower upper`); the
+limits become STARLIB-style factor uncertainties `sqrt(upper/lower)`.
+Threshold reactions are tabulated only above their onset temperature, where
+the papers' omitted rows mean "negligible": each table is padded down to the
+STARLIB grid start with the rate floor (and flat up to 10 GK if needed) so
+trajectory evaluation never leaves the interpolation domain.
+"""
+function read_tabulated_rates(
+    path::AbstractString;
+    source::AbstractString,
+    partition_functions=nothing,
+    include_total_variants::Bool=false,
+)
+    isfile(path) || error("tabulated rate file not found at $path")
+    tables = ReactionRateTable[]
+
+    reactants = String[]
+    products = String[]
+    variant = "standard"
+    T9 = Float64[]
+    rate = Float64[]
+    factor_uncertainty = Float64[]
+
+    header_pattern = r"^reaction:\s+(.+?)\s+->\s+(.+?)\s+;\s+label:.*;\s+variant:\s+(\w+)\s*$"
+
+    for (line_number, raw_line) in enumerate(eachline(path))
+        line = strip(raw_line)
+        (isempty(line) || startswith(line, "#")) && continue
+
+        if startswith(line, "reaction:")
+            m = match(header_pattern, line)
+            m === nothing && error("malformed reaction header at line $line_number of $path: $line")
+            reactants = normalize_species_name.(split(m.captures[1]))
+            products = normalize_species_name.(split(m.captures[2]))
+            variant = m.captures[3]
+            T9 = Float64[]
+            rate = Float64[]
+            factor_uncertainty = Float64[]
+        elseif line == "end"
+            isempty(reactants) && error("'end' without a reaction header at line $line_number of $path")
+            if !(variant == "total" && !include_total_variants) && !isempty(T9)
+                q = 0.0
+                if partition_functions !== nothing
+                    computed = reaction_q_value(partition_functions, reactants, products)
+                    computed === nothing || (q = computed)
+                end
+                if first(T9) > first(STARLIB_T9_GRID)
+                    pushfirst!(T9, first(STARLIB_T9_GRID))
+                    pushfirst!(rate, GENERATED_REVERSE_RATE_FLOOR)
+                    pushfirst!(factor_uncertainty, 1.0)
+                end
+                if last(T9) < last(STARLIB_T9_GRID)
+                    push!(T9, last(STARLIB_T9_GRID))
+                    push!(rate, last(rate))
+                    push!(factor_uncertainty, last(factor_uncertainty))
+                end
+                chapter = length(reactants) == 2 ? (length(products) == 1 ? 4 : 5) : 1
+                push!(tables, ReactionRateTable(
+                    chapter,
+                    copy(reactants),
+                    copy(products),
+                    String(source),
+                    q,
+                    copy(T9),
+                    copy(rate),
+                    copy(factor_uncertainty),
+                ))
+            end
+            reactants = String[]
+            products = String[]
+        else
+            fields = split(line)
+            length(fields) in (2, 4) || error("malformed data row at line $line_number of $path: $line")
+            push!(T9, parse(Float64, fields[1]))
+            push!(rate, parse(Float64, fields[2]))
+            if length(fields) == 4
+                lower = parse(Float64, fields[3])
+                upper = parse(Float64, fields[4])
+                (lower > 0.0 && upper >= lower) || error("invalid rate limits at line $line_number of $path: $line")
+                push!(factor_uncertainty, sqrt(upper / lower))
+            else
+                push!(factor_uncertainty, 1.0)
+            end
+        end
+    end
+
+    return tables
+end
+
+"""
+    read_iliadis2001_rates(path=DEFAULT_ILIADIS2001_PATH; kwargs...)
+
+Read the recommended reaction rates of Iliadis et al. (2001, ApJS 134, 151),
+extracted from the paper's Tables 3-9, as `ReactionRateTable`s with source
+`"il01tab"`. See `read_tabulated_rates` for the keyword arguments.
+"""
+read_iliadis2001_rates(path::AbstractString=DEFAULT_ILIADIS2001_PATH; kwargs...) =
+    read_tabulated_rates(path; source="il01tab", kwargs...)
+
+"""
+    read_nacre_rates(path=DEFAULT_NACRE_PATH; kwargs...)
+
+Read the adopted reaction rates of the NACRE compilation (Angulo et al.
+1999), extracted from the paper's rate tables, as `ReactionRateTable`s with
+source `"nacrtab"`. See `read_tabulated_rates` for the keyword arguments.
+"""
+read_nacre_rates(path::AbstractString=DEFAULT_NACRE_PATH; kwargs...) =
+    read_tabulated_rates(path; source="nacrtab", kwargs...)
+
+#=
+Interpolate the normalized partition function of one species. Outside the
+tabulated range the edge values are used; at nova temperatures (below the
+0.1 GK grid start) G is 1 to excellent accuracy for all relevant nuclides.
+Returns `nothing` when the species is not in the table.
 =#
-function generated_detailed_balance_reverse_table(table::ReactionRateTable; source::AbstractString="detail_balance")
+function _partition_function_at(pf::PartitionFunctionTable, name::AbstractString, T9::Real)
+    key = normalize_species_name(name)
+    haskey(pf.G, key) || return nothing
+    values = pf.G[key]
+    T = Float64(T9)
+    T <= first(pf.T9) && return values[1]
+    T >= last(pf.T9) && return values[end]
+    return _interpolate_loglog(pf.T9, values, T; value_name="partition function")
+end
+
+_statistical_weight(pf::PartitionFunctionTable, name::AbstractString) =
+    get(pf.g0, normalize_species_name(name), nothing)
+
+"""
+    generated_detailed_balance_reverse_table(table; partition_functions=nothing)
+
+Generate a detailed-balance reverse table for a radiative-capture style
+two-body forward reaction `a + b -> c`:
+
+    lambda_rev = C * T9^(3/2) * (Aa*Ab/Ac)^(3/2) * (ga*gb/gc) * (Ga*Gb/Gc)(T9)
+                 * exp(-11.605*Q/T9) * N_A<sigma v>_fwd
+
+With `partition_functions` (a `PartitionFunctionTable` from `read_winvne`)
+the spin factors `g = 2J+1` and normalized partition functions `G(T9)` are
+included; participants missing from the table fall back to `g*G = 1`.
+Without it only the mass-factor and Boltzmann terms are used, which is the
+historical approximate behavior. Prefer explicit reverse tables from the
+rate library when they exist.
+"""
+function generated_detailed_balance_reverse_table(
+    table::ReactionRateTable;
+    source::AbstractString="detail_balance",
+    partition_functions=nothing,
+)
     _can_generate_detailed_balance_reverse(table) || throw(ArgumentError("can only generate detailed-balance reverse rates for exothermic two-body to one-body reactions"))
 
     product_mass = _mass_number_factor(table.products)
     reactant_mass = _mass_number_factor(table.reactants)
     mass_factor = (reactant_mass / product_mass)^(3.0 / 2.0)
 
+    spin_factor = 1.0
+    if partition_functions !== nothing
+        weights = [_statistical_weight(partition_functions, name) for name in vcat(table.reactants, table.products)]
+        if !any(isnothing, weights)
+            spin_factor = (weights[1] * weights[2]) / weights[3]
+        end
+    end
+
     reverse_rate = Float64[]
     sizehint!(reverse_rate, length(table.T9))
     for (T9, forward_rate) in zip(table.T9, table.rate)
         boltzmann = exp(-DETAILED_BALANCE_Q_FACTOR * table.q_value / T9)
-        value = DETAILED_BALANCE_CAPTURE_CONSTANT * T9^(3.0 / 2.0) * mass_factor * forward_rate * boltzmann
+        pf_ratio = 1.0
+        if partition_functions !== nothing
+            G_a = _partition_function_at(partition_functions, table.reactants[1], T9)
+            G_b = _partition_function_at(partition_functions, table.reactants[2], T9)
+            G_c = _partition_function_at(partition_functions, table.products[1], T9)
+            if G_a !== nothing && G_b !== nothing && G_c !== nothing
+                pf_ratio = (G_a * G_b) / G_c
+            end
+        end
+        value = DETAILED_BALANCE_CAPTURE_CONSTANT * T9^(3.0 / 2.0) * mass_factor * spin_factor * pf_ratio * forward_rate * boltzmann
         push!(reverse_rate, max(value, GENERATED_REVERSE_RATE_FLOOR))
     end
 
@@ -1059,18 +1832,23 @@ function generated_detailed_balance_reverse_table(table::ReactionRateTable; sour
     )
 end
 
-#=
-    add_reverse_reaction_tables(all_tables, forward_tables; generate_detailed_balance=true)
+"""
+    add_reverse_reaction_tables(all_tables, forward_tables;
+                                generate_detailed_balance=true,
+                                partition_functions=nothing)
 
 Return a named tuple containing forward tables plus reverse tables. Exact
-reverse STARLIB entries are preferred. If no explicit reverse exists and the
-forward table is a supported radiative-capture-style `2 -> 1` reaction, an
-approximate detailed-balance reverse table is generated.
-=#
+reverse entries from the rate library are preferred. If no explicit reverse
+exists and the forward table is a supported radiative-capture-style `2 -> 1`
+reaction, a detailed-balance reverse table is generated; pass
+`partition_functions` from `read_winvne` to include spin factors and
+partition-function ratios in the generated rates.
+"""
 function add_reverse_reaction_tables(
     all_tables::AbstractVector{ReactionRateTable},
     forward_tables::AbstractVector{ReactionRateTable};
     generate_detailed_balance::Bool=true,
+    partition_functions=nothing,
 )
     reverse_lookup = _reverse_table_lookup(all_tables)
     selected = _unique_reaction_tables(forward_tables)
@@ -1090,7 +1868,7 @@ function add_reverse_reaction_tables(
             end
             explicit += 1
         elseif generate_detailed_balance && _can_generate_detailed_balance_reverse(table)
-            reverse_table = generated_detailed_balance_reverse_table(table)
+            reverse_table = generated_detailed_balance_reverse_table(table; partition_functions=partition_functions)
             key = _reaction_participant_key(reverse_table)
             if !(key in seen)
                 push!(selected, reverse_table)
@@ -1120,12 +1898,12 @@ function _select_rate_table(matches::Vector{ReactionRateTable}, label::AbstractS
     end
 end
 
-#=
+"""
     reaction_from_label(tables, label; source=nothing, on_multiple=:error)
 
 Find a STARLIB rate table by reaction label and wrap it as a `Reaction`.
 If multiple entries match, choose a `source`, or set `on_multiple=:first`.
-=#
+"""
 function reaction_from_label(
     tables::AbstractVector{ReactionRateTable},
     label::AbstractString;
@@ -1178,7 +1956,7 @@ function _h_ca_candidate_species(
     return true
 end
 
-#=
+"""
     select_h_ca_reaction_tables(tables, seed_species)
 
 Select a broader H-Ca nova post-processing network from STARLIB. The selector is
@@ -1186,7 +1964,7 @@ deliberately less broad than "all H-Ca rows": it starts from the supplied seed
 composition, follows weak, proton, and alpha links, and keeps species inside a
 bounded stable/proton-rich isotope band. This keeps single-zone examples
 tractable while covering the main H-Ca nova flows.
-=#
+"""
 function select_h_ca_reaction_tables(
     tables::AbstractVector{ReactionRateTable},
     seed_species;
@@ -1413,17 +2191,17 @@ function interpolate_rate(table::ReactionRateTable, T9::Real)
     return _interpolate_loglog(table.T9, table.rate, T9; value_name="rate")
 end
 
-#=
+"""
     interpolate_factor_uncertainty(table, T9)
 
 Interpolate STARLIB's multiplicative factor uncertainty at temperature `T9`.
 The interpolation is log-log, matching `interpolate_rate`.
-=#
+"""
 function interpolate_factor_uncertainty(table::ReactionRateTable, T9::Real)
     return _interpolate_loglog(table.T9, table.factor_uncertainty, T9; value_name="factor uncertainty")
 end
 
-#=
+"""
     sampled_interpolate_rate(table, T9, p)
 
 Return a STARLIB lognormal sampled reaction rate:
@@ -1432,7 +2210,7 @@ Return a STARLIB lognormal sampled reaction rate:
 
 where `p` is usually a standard normal deviate held fixed for a reaction during
 one Monte Carlo network run.
-=#
+"""
 function sampled_interpolate_rate(table::ReactionRateTable, T9::Real, p::Real)
     rate = interpolate_rate(table, T9)
     factor_uncertainty = interpolate_factor_uncertainty(table, T9)
@@ -1496,6 +2274,38 @@ function _compile_reaction(reaction::Reaction, species_index::AbstractDict, nspe
         stoichiometric_delta[index] += count
     end
 
+    charge_pair_sum = 0.0
+    screening_pairs = NTuple{4,Float64}[]
+    if length(reaction.reactants) >= 2
+        charges = Int[]
+        masses = Int[]
+        for name in reaction.reactants
+            species = try
+                species_from_name(name)
+            catch
+                Species(String(name), 0, 0)
+            end
+            push!(charges, species.Z)
+            push!(masses, species.A)
+        end
+
+        for i in 1:(length(charges) - 1), j in (i + 1):length(charges)
+            if charges[i] > 0 && charges[j] > 0
+                charge_pair_sum += charges[i] * charges[j]
+            end
+        end
+
+        accumulated_Z = charges[1]
+        accumulated_A = masses[1]
+        for k in 2:length(charges)
+            if accumulated_Z > 0 && charges[k] > 0
+                push!(screening_pairs, (Float64(accumulated_Z), Float64(accumulated_A), Float64(charges[k]), Float64(masses[k])))
+            end
+            accumulated_Z += charges[k]
+            accumulated_A += masses[k]
+        end
+    end
+
     return CompiledReaction(
         reactant_indices,
         product_indices,
@@ -1506,6 +2316,8 @@ function _compile_reaction(reaction::Reaction, species_index::AbstractDict, nspe
         stoichiometric_delta,
         Float64(_symmetry_factor(reaction.reactants)),
         length(reaction.reactants),
+        charge_pair_sum,
+        screening_pairs,
     )
 end
 
@@ -1518,13 +2330,13 @@ function _screening_composition_factor(network::ReactionNetwork, Y::AbstractVect
     return factor
 end
 
-#=
+"""
     weak_screening_multiplier(network, reaction, Y, rho, T9)
 
 Return an approximate weak-screening multiplier for charged-particle reactions.
 This is a Salpeter-style diagnostic multiplier using the current abundance
 composition. Reactions with fewer than two charged reactants return `1.0`.
-=#
+"""
 function weak_screening_multiplier(
     network::ReactionNetwork,
     reaction::Reaction,
@@ -1558,19 +2370,146 @@ function weak_screening_multiplier(
     return exp(min(exponent, Float64(max_exponent)))
 end
 
+# CGS constants for the Chugunov screening evaluation (CODATA 2018).
+const _ELEMENTARY_CHARGE_ESU = 4.80320471257e-10
+const _BOLTZMANN_ERG_PER_K = 1.380649e-16
+const _HBAR_ERG_S = 1.054571817e-27
+const _ATOMIC_MASS_UNIT_G = 1.66053906660e-24
+
+# Half-cosine transition between y=x and y=limit, starting at x=start.
+# Ported from pynucastro's screening module.
+function _smooth_clip(x::Float64, limit::Float64, start::Float64)
+    lower, upper = limit < start ? (limit, x) : (x, limit)
+    x < min(limit, start) && return lower
+    x > max(limit, start) && return upper
+    fraction = (1.0 - cos(pi * (x - min(limit, start)) / (start - limit))) / 2.0
+    return (1.0 - fraction) * lower + fraction * upper
+end
+
+#=
+Composition-dependent plasma quantities for Chugunov screening: the electron
+number density and the temperature-independent part of the electron Coulomb
+coupling parameter. `n_e = rho * sum(Z_i Y_i) / m_u`.
+=#
+function _ion_plasma_state(network::ReactionNetwork, Y::AbstractVector{<:Real}, rho::Real)
+    charge_abundance = 0.0
+    for (i, species) in pairs(network.species_info)
+        species.Z <= 0 && continue
+        charge_abundance += species.Z * max(Float64(Y[i]), 0.0)
+    end
+    charge_abundance > 0.0 || return nothing
+
+    n_e = Float64(rho) * charge_abundance / _ATOMIC_MASS_UNIT_G
+    gamma_e_fac = _ELEMENTARY_CHARGE_ESU^2 / _BOLTZMANN_ERG_PER_K * cbrt(4.0 * pi / 3.0) * cbrt(n_e)
+    return (n_e=n_e, gamma_e_fac=gamma_e_fac)
+end
+
+#=
+Screening exponent h = ln(f_screen) of one ion pair following Chugunov,
+DeWitt & Yakovlev (2007), extended to multi-component plasmas as in Yakovlev
+et al. (2006). Ported from pynucastro's `chugunov_2007`, which documents the
+substitutions (Z^2 -> Z1*Z2, n_i -> n_e/ztilde^3, m_i -> 2*mu12*m_u). Valid
+from the weak-screening limit through the strong-screening regime; the fit
+caps at Gamma ~ 600 and T ~ 0.1 T_p.
+=#
+function _chugunov_pair_exponent(Z1::Float64, A1::Float64, Z2::Float64, A2::Float64, temperature_K::Float64, n_e::Float64, gamma_e_fac::Float64)
+    ztilde = (cbrt(Z1) + cbrt(Z2)) / 2.0
+    reduced_mass = A1 * A2 / (A1 + A2)
+    n_i = n_e / ztilde^3
+    m_i = 2.0 * reduced_mass * _ATOMIC_MASS_UNIT_G
+
+    T_p = _HBAR_ERG_S / _BOLTZMANN_ERG_PER_K * _ELEMENTARY_CHARGE_ESU * sqrt(4.0 * pi * Z1 * Z2 * n_i / m_i)
+    T_norm = _smooth_clip(temperature_K / T_p, 0.1, 0.2)
+    Gamma = _smooth_clip(gamma_e_fac * Z1 * Z2 / (ztilde * T_norm * T_p), 600.0, 590.0)
+
+    zeta = cbrt(4.0 / (3.0 * pi^2 * T_norm^2))
+    poly = 1.0 + zeta * (0.022 + zeta * ((0.41 - 0.6 / Gamma) + (0.06 + 2.2 / Gamma) * zeta))
+    gamtilde = Gamma / cbrt(poly)
+    gamtilde2 = gamtilde^2
+
+    A1_fit = 2.7822
+    A2_fit = 98.34
+    A3_fit = sqrt(3.0) - A1_fit / sqrt(A2_fit)
+    B1_fit = -1.7476
+    B2_fit = 66.07
+    B3_fit = 1.12
+    B4_fit = 65.0
+
+    h = gamtilde^1.5 * (A1_fit / sqrt(A2_fit + gamtilde) + A3_fit / (1.0 + gamtilde)) +
+        B1_fit * gamtilde2 / (B2_fit + gamtilde) +
+        B3_fit * gamtilde2 / (B4_fit + gamtilde2)
+    return max(h, 0.0)
+end
+
+function _chugunov_reaction_multiplier(compiled::CompiledReaction, context, T9::Real)
+    (!context.plasma_active || isempty(compiled.screening_pairs)) && return 1.0
+    temperature_K = 1.0e9 * Float64(T9)
+    exponent = 0.0
+    for (Z1, A1, Z2, A2) in compiled.screening_pairs
+        exponent += _chugunov_pair_exponent(Z1, A1, Z2, A2, temperature_K, context.n_e, context.gamma_e_fac)
+    end
+    return exp(min(exponent, _SCREENING_MAX_EXPONENT))
+end
+
+"""
+    chugunov_screening_multiplier(network, reaction, Y, rho, T9)
+
+Chugunov, DeWitt & Yakovlev (2007) screening multiplier for one reaction at
+the current composition. Available network-wide with `screening=:chugunov`.
+"""
+function chugunov_screening_multiplier(
+    network::ReactionNetwork,
+    reaction::Reaction,
+    Y::AbstractVector{<:Real},
+    rho::Real,
+    T9::Real,
+)
+    T9 > 0.0 || throw(ArgumentError("T9 must be positive for screening"))
+    rho > 0.0 || throw(ArgumentError("rho must be positive for screening"))
+    length(reaction.reactants) >= 2 || return 1.0
+
+    plasma = _ion_plasma_state(network, Y, rho)
+    plasma === nothing && return 1.0
+
+    temperature_K = 1.0e9 * Float64(T9)
+    exponent = 0.0
+    accumulated_Z = 0
+    accumulated_A = 0
+    for (k, name) in pairs(reaction.reactants)
+        species = try
+            species_from_name(name)
+        catch
+            Species(String(name), 0, 0)
+        end
+        if k > 1 && accumulated_Z > 0 && species.Z > 0
+            exponent += _chugunov_pair_exponent(
+                Float64(accumulated_Z), Float64(accumulated_A),
+                Float64(species.Z), Float64(species.A),
+                temperature_K, plasma.n_e, plasma.gamma_e_fac,
+            )
+        end
+        accumulated_Z += species.Z
+        accumulated_A += species.A
+    end
+
+    return exp(min(exponent, _SCREENING_MAX_EXPONENT))
+end
+
 function _screening_multiplier(screening, network::ReactionNetwork, reaction::Reaction, Y::AbstractVector{<:Real}, rho::Real, T9::Real)
     if screening === nothing || screening === false
         return 1.0
     elseif screening == :weak
         return weak_screening_multiplier(network, reaction, Y, rho, T9)
+    elseif screening == :chugunov
+        return chugunov_screening_multiplier(network, reaction, Y, rho, T9)
     elseif screening isa Function
         return Float64(screening(network, reaction, Y, rho, T9))
     end
 
-    throw(ArgumentError("unsupported screening=$screening; use nothing, :weak, or a function `(network, reaction, Y, rho, T9) -> multiplier`"))
+    throw(ArgumentError("unsupported screening=$screening; use nothing, :weak, :chugunov, or a function `(network, reaction, Y, rho, T9) -> multiplier`"))
 end
 
-#=
+"""
     reaction_flux(reaction, Y, species_index, rho, T9; rate_multiplier=1.0)
 
 Calculate the abundance flux for one reaction.
@@ -1581,7 +2520,7 @@ Calculate the abundance flux for one reaction.
 For a one-body reaction, the flux is `rate * Yᵢ`. For a two-body reaction using
 STARLIB's usual `N_A <σv>` rate, the flux is `rho * rate * Yᵢ * Yⱼ`, with the
 standard symmetry correction for identical reactants.
-=#
+"""
 function reaction_flux(
     reaction::Reaction,
     Y::AbstractVector{<:Real},
@@ -1698,12 +2637,194 @@ function network_rhs(
         p_value = rate_p_values === nothing ? nothing : rate_p_values[reaction_number]
         flux = _reaction_flux(network, reaction, compiled, Y, rho, T9; rate_multiplier=multiplier, rate_p_value=p_value, screening=screening)
 
-        for i in eachindex(dYdt)
-            dYdt[i] += compiled.stoichiometric_delta[i] * flux
+        for (index, count) in zip(compiled.reactant_species_indices, compiled.reactant_species_counts)
+            dYdt[index] -= count * flux
+        end
+        for (index, count) in zip(compiled.product_species_indices, compiled.product_species_counts)
+            dYdt[index] += count * flux
         end
     end
 
     return dYdt
+end
+
+#=
+Per-step solver cache.
+
+Within one solver step the temperature and density are fixed, so the
+interpolated rate, the density power, the symmetry factor, and any rate
+multipliers are constant. `NetworkStepCache` hoists all of that out of the
+abundance loops: an RHS or Jacobian evaluation then only multiplies cached
+prefactors by abundance products. This changes no mathematics — only where
+the temperature-dependent work is done.
+
+Custom screening functions cannot be decomposed this way, so
+`_build_step_cache` returns `nothing` for them and callers fall back to the
+uncached path.
+=#
+struct NetworkStepCache
+    rho::Float64
+    T9::Float64
+    prefactors::Vector{Float64}
+    screening::Symbol
+    screening_scale::Float64
+end
+
+function _build_step_cache(
+    network::ReactionNetwork,
+    rho_t::Real,
+    T9_t::Real;
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    screening=nothing,
+)
+    screening isa Function && return nothing
+    mode = screening === nothing || screening === false ? :none :
+           screening == :weak ? :weak :
+           screening == :chugunov ? :chugunov :
+           throw(ArgumentError("unsupported screening=$screening; use nothing, :weak, :chugunov, or a function `(network, reaction, Y, rho, T9) -> multiplier`"))
+
+    nreactions = length(network.reactions)
+    if rate_multipliers !== nothing && length(rate_multipliers) != nreactions
+        throw(ArgumentError("rate_multipliers must have the same length as reactions"))
+    end
+    if rate_p_values !== nothing && length(rate_p_values) != nreactions
+        throw(ArgumentError("rate_p_values must have the same length as reactions"))
+    end
+
+    rho_value = Float64(rho_t)
+    T9_value = Float64(T9_t)
+    prefactors = Vector{Float64}(undef, nreactions)
+    for r in 1:nreactions
+        table = network.reactions[r].rate_table
+        compiled = network.compiled_reactions[r]
+        p_value = rate_p_values === nothing ? nothing : rate_p_values[r]
+        base_rate = p_value === nothing ? interpolate_rate(table, T9_value) : sampled_interpolate_rate(table, T9_value, p_value)
+        multiplier = rate_multipliers === nothing ? 1.0 : Float64(rate_multipliers[r])
+        prefactors[r] = multiplier * base_rate * rho_value^(compiled.nreactants - 1) / compiled.symmetry_factor
+    end
+
+    screening_scale = 0.0
+    if mode != :none
+        T9_value > 0.0 || throw(ArgumentError("T9 must be positive for screening"))
+        rho_value > 0.0 || throw(ArgumentError("rho must be positive for screening"))
+        if mode == :weak
+            T6 = 1000.0 * T9_value
+            screening_scale = 0.188 * sqrt(rho_value / T6^3)
+        end
+    end
+
+    return NetworkStepCache(rho_value, T9_value, prefactors, mode, screening_scale)
+end
+
+const _SCREENING_MAX_EXPONENT = 300.0
+
+function _screening_zeta_scale(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{Float64})
+    cache.screening == :weak || return 0.0
+    zeta = _screening_composition_factor(network, Y)
+    zeta > 0.0 || return 0.0
+    return cache.screening_scale * sqrt(zeta)
+end
+
+@inline function _cached_screening_multiplier(compiled::CompiledReaction, zeta_scale::Float64)
+    (zeta_scale > 0.0 && compiled.charge_pair_sum > 0.0) || return 1.0
+    return exp(min(compiled.charge_pair_sum * zeta_scale, _SCREENING_MAX_EXPONENT))
+end
+
+# Per-evaluation screening context: the composition-dependent scalars shared
+# by every reaction of one RHS/Jacobian evaluation. A concrete struct keeps
+# the per-reaction screening call dispatch-free and allocation-free.
+struct ScreeningContext
+    zeta_scale::Float64
+    n_e::Float64
+    gamma_e_fac::Float64
+    plasma_active::Bool
+end
+
+function _screening_context(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{Float64})
+    if cache.screening == :weak
+        return ScreeningContext(_screening_zeta_scale(cache, network, Y), 0.0, 0.0, false)
+    elseif cache.screening == :chugunov
+        plasma = _ion_plasma_state(network, Y, cache.rho)
+        plasma === nothing && return ScreeningContext(0.0, 0.0, 0.0, false)
+        return ScreeningContext(0.0, plasma.n_e, plasma.gamma_e_fac, true)
+    end
+    return ScreeningContext(0.0, 0.0, 0.0, false)
+end
+
+@inline function _cached_reaction_screening(cache::NetworkStepCache, compiled::CompiledReaction, context::ScreeningContext)
+    if cache.screening == :weak
+        return _cached_screening_multiplier(compiled, context.zeta_scale)
+    elseif cache.screening == :chugunov
+        return _chugunov_reaction_multiplier(compiled, context, cache.T9)
+    end
+    return 1.0
+end
+
+# In-place dY/dt with all temperature-dependent factors taken from the cache.
+function _cached_network_rhs!(dYdt::Vector{Float64}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{Float64})
+    fill!(dYdt, 0.0)
+    screening_context = _screening_context(cache, network, Y)
+
+    @inbounds for r in eachindex(network.compiled_reactions)
+        compiled = network.compiled_reactions[r]
+        flux = cache.prefactors[r] * _cached_reaction_screening(cache, compiled, screening_context)
+        for index in compiled.reactant_indices
+            flux *= Y[index]
+        end
+        flux == 0.0 && continue
+
+        for (index, count) in zip(compiled.reactant_species_indices, compiled.reactant_species_counts)
+            dYdt[index] -= count * flux
+        end
+        for (index, count) in zip(compiled.product_species_indices, compiled.product_species_counts)
+            dYdt[index] += count * flux
+        end
+    end
+
+    return dYdt
+end
+
+#=
+Analytic Jacobian d(dY/dt)/dY. The flux of each reaction is a polynomial in
+the reactant abundances, so the derivative follows from the product rule over
+the distinct reactant species. The weak-screening multiplier is treated as
+constant with respect to Y; Newton's converged answer is fixed by the exact
+residual alone, so this only shapes the iteration path, not the solution.
+=#
+function _cached_network_jacobian!(J::Matrix{Float64}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{Float64})
+    fill!(J, 0.0)
+    screening_context = _screening_context(cache, network, Y)
+
+    @inbounds for r in eachindex(network.compiled_reactions)
+        compiled = network.compiled_reactions[r]
+        base = cache.prefactors[r] * _cached_reaction_screening(cache, compiled, screening_context)
+        base == 0.0 && continue
+
+        reactant_indices = compiled.reactant_species_indices
+        reactant_counts = compiled.reactant_species_counts
+        for jpos in eachindex(reactant_indices)
+            jindex = reactant_indices[jpos]
+            count_j = reactant_counts[jpos]
+            derivative = Float64(count_j)
+            count_j > 1 && (derivative *= Y[jindex]^(count_j - 1))
+            for kpos in eachindex(reactant_indices)
+                kpos == jpos && continue
+                derivative *= Y[reactant_indices[kpos]]^reactant_counts[kpos]
+            end
+            dflux = base * derivative
+            dflux == 0.0 && continue
+
+            for (index, count) in zip(reactant_indices, reactant_counts)
+                J[index, jindex] -= count * dflux
+            end
+            for (index, count) in zip(compiled.product_species_indices, compiled.product_species_counts)
+                J[index, jindex] += count * dflux
+            end
+        end
+    end
+
+    return J
 end
 
 #=
@@ -1951,7 +3072,7 @@ function integrated_energy_generation(times::AbstractVector{<:Real}, epsilon_his
     return total
 end
 
-#=
+"""
     species_flux_balance(network, Y, rho, T9; rate_multipliers=nothing)
 
 Calculate instantaneous production, destruction, and net `dY/dt` contributions
@@ -1959,7 +3080,7 @@ for every species.
 
 Returns `(production=..., destruction=..., net=...)`, with vectors ordered like
 `network.species`.
-=#
+"""
 function species_flux_balance(
     network::ReactionNetwork,
     Y::AbstractVector{<:Real},
@@ -2024,14 +3145,14 @@ function _species_property_sum(names::AbstractVector{String}, property::Symbol)
     return total
 end
 
-#=
+"""
     reaction_conservation(reaction)
 
 Check baryon-number (`A`) and charge (`Z`) conservation for one reaction.
 Returns a named tuple with reactant/product totals and boolean conservation flags.
 
 Photons, if present, are treated as `A=0`, `Z=0`.
-=#
+"""
 function reaction_conservation(reaction::Reaction)
     reactant_A = _species_property_sum(reaction.reactants, :A)
     product_A = _species_property_sum(reaction.products, :A)
@@ -2112,7 +3233,7 @@ function _reaction_validation_report(network::ReactionNetwork, reaction_index::I
     )
 end
 
-#=
+"""
     network_validation_report(network; throw_on_error=false)
 
 Validate basic reaction-network bookkeeping and physics constraints.
@@ -2125,7 +3246,7 @@ Checks currently include:
 
 Returns a named tuple containing summary information, per-reaction reports, and
 all issues. If `throw_on_error=true`, invalid networks raise an `ArgumentError`.
-=#
+"""
 function network_validation_report(network::ReactionNetwork; throw_on_error::Bool=false)
     issues = _network_species_issues(network)
     reaction_reports = NamedTuple[]
@@ -2189,16 +3310,44 @@ function _rhs_at(network::ReactionNetwork, Y::AbstractVector{<:Real}, rho, T9, t
     return network_rhs(Y, network, rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
 end
 
+function _step_cache_at(network::ReactionNetwork, rho, T9, t::Float64; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
+    return _build_step_cache(
+        network,
+        _profile_value(rho, t),
+        _profile_value(T9, t);
+        rate_multipliers=rate_multipliers,
+        rate_p_values=rate_p_values,
+        screening=screening,
+    )
+end
+
 function _euler_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
-    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    cache = _step_cache_at(network, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    if cache === nothing
+        k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    else
+        k1 = _cached_network_rhs!(similar(Y), network, cache, Y)
+    end
     return Y .+ dt .* k1
 end
 
 function _rk4_step(network::ReactionNetwork, Y::Vector{Float64}, t::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
-    k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
-    k2 = _rhs_at(network, Y .+ 0.5 * dt .* k1, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
-    k3 = _rhs_at(network, Y .+ 0.5 * dt .* k2, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
-    k4 = _rhs_at(network, Y .+ dt .* k3, rho, T9, t + dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    cache_start = _step_cache_at(network, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+
+    if cache_start === nothing
+        k1 = _rhs_at(network, Y, rho, T9, t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        k2 = _rhs_at(network, Y .+ 0.5 * dt .* k1, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        k3 = _rhs_at(network, Y .+ 0.5 * dt .* k2, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        k4 = _rhs_at(network, Y .+ dt .* k3, rho, T9, t + dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        return Y .+ (dt / 6.0) .* (k1 .+ 2.0 .* k2 .+ 2.0 .* k3 .+ k4)
+    end
+
+    cache_mid = _step_cache_at(network, rho, T9, t + 0.5 * dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    cache_end = _step_cache_at(network, rho, T9, t + dt; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    k1 = _cached_network_rhs!(similar(Y), network, cache_start, Y)
+    k2 = _cached_network_rhs!(similar(Y), network, cache_mid, Y .+ 0.5 * dt .* k1)
+    k3 = _cached_network_rhs!(similar(Y), network, cache_mid, Y .+ 0.5 * dt .* k2)
+    k4 = _cached_network_rhs!(similar(Y), network, cache_end, Y .+ dt .* k3)
     return Y .+ (dt / 6.0) .* (k1 .+ 2.0 .* k2 .+ 2.0 .* k3 .+ k4)
 end
 
@@ -2271,39 +3420,80 @@ function _backward_euler_step(
     newton_tolerance::Real=1.0e-10,
     max_newton_iterations::Integer=20,
     finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    jacobian::Symbol=:analytic,
     newton_iterations=nothing,
 )
     max_newton_iterations > 0 || throw(ArgumentError("max_newton_iterations must be positive"))
     newton_tolerance > 0.0 || throw(ArgumentError("newton_tolerance must be positive"))
     finite_difference_epsilon > 0.0 || throw(ArgumentError("finite_difference_epsilon must be positive"))
+    jacobian in (:analytic, :finite_difference) || throw(ArgumentError("unsupported jacobian=$jacobian; use :analytic or :finite_difference"))
 
     t_next = t + dt
     Y_next = _euler_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
 
-    residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    # All Newton residuals of this step share the fixed (rho, T9) at t_next.
+    cache = _step_cache_at(network, rho, T9, t_next; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+    n = length(Y)
+    rhs_buffer = cache === nothing ? nothing : Vector{Float64}(undef, n)
+
+    residual_at = function (Y_trial::Vector{Float64})
+        if cache === nothing
+            return _backward_euler_residual(network, Y_trial, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+        end
+        _cached_network_rhs!(rhs_buffer, network, cache, Y_trial)
+        return Y_trial .- Y .- dt .* rhs_buffer
+    end
+
+    residual = residual_at(Y_next)
     tolerance = Float64(newton_tolerance) * max(_max_abs(Y_next), 1.0)
     if _max_abs(residual) <= tolerance
         newton_iterations !== nothing && push!(newton_iterations, 0)
         return Y_next
     end
 
+    use_analytic_jacobian = cache !== nothing && jacobian == :analytic
+    jacobian_buffer = use_analytic_jacobian ? Matrix{Float64}(undef, n, n) : nothing
+
     for iteration in 1:max_newton_iterations
         residual_norm = _max_abs(residual)
-        jacobian = _backward_euler_jacobian(
-            network,
-            Y_next,
-            residual,
-            Y,
-            t_next,
-            dt,
-            rho,
-            T9,
-            Float64(finite_difference_epsilon);
-            rate_multipliers=rate_multipliers,
-            rate_p_values=rate_p_values,
-            screening=screening,
-        )
-        correction = jacobian \ (-residual)
+        if use_analytic_jacobian
+            # Newton matrix of the residual: I - dt * d(dY/dt)/dY.
+            _cached_network_jacobian!(jacobian_buffer, network, cache, Y_next)
+            @inbounds for j in 1:n
+                for i in 1:n
+                    jacobian_buffer[i, j] = -dt * jacobian_buffer[i, j]
+                end
+                jacobian_buffer[j, j] += 1.0
+            end
+            jacobian_matrix = jacobian_buffer
+        else
+            jacobian_matrix = _backward_euler_jacobian(
+                network,
+                Y_next,
+                residual,
+                Y,
+                t_next,
+                dt,
+                rho,
+                T9,
+                Float64(finite_difference_epsilon);
+                rate_multipliers=rate_multipliers,
+                rate_p_values=rate_p_values,
+                screening=screening,
+            )
+        end
+        # A singular Newton matrix (e.g. dt so large that I - dt*J loses the
+        # identity part to rounding along a conserved direction) is a step
+        # failure, not a fatal error: report non-convergence so adaptive
+        # drivers shrink dt and retry.
+        correction = try
+            jacobian_matrix \ (-residual)
+        catch err
+            if err isa LinearAlgebra.SingularException || err isa LinearAlgebra.LAPACKException
+                throw(NewtonConvergenceError(iteration, residual_norm))
+            end
+            rethrow()
+        end
 
         _all_finite(correction) || throw(NewtonConvergenceError(iteration, residual_norm))
 
@@ -2318,7 +3508,7 @@ function _backward_euler_step(
             trial = Y_next .+ alpha .* correction
             _clamp_tiny_negative_trials!(trial, 1.0e-30)
             if _all_finite(trial) && minimum(trial; init=0.0) >= 0.0
-                trial_residual = _backward_euler_residual(network, trial, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+                trial_residual = residual_at(trial)
                 trial_residual_norm = _max_abs(trial_residual)
                 if trial_residual_norm < best_residual_norm
                     best_trial = trial
@@ -2341,7 +3531,7 @@ function _backward_euler_step(
                 residual = best_residual
             else
                 Y_next .+= correction
-                residual = _backward_euler_residual(network, Y_next, Y, t_next, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
+                residual = residual_at(Y_next)
             end
         end
 
@@ -2427,6 +3617,7 @@ function solve_network(
     newton_tolerance::Real=1.0e-10,
     max_newton_iterations::Integer=20,
     finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    jacobian::Symbol=:analytic,
     return_stats::Bool=false,
 )
     times = _time_grid(tspan, dt)
@@ -2458,6 +3649,7 @@ function solve_network(
                 newton_tolerance=newton_tolerance,
                 max_newton_iterations=max_newton_iterations,
                 finite_difference_epsilon=finite_difference_epsilon,
+                jacobian=jacobian,
                 newton_iterations=newton_iterations,
             )
         else
@@ -2491,6 +3683,7 @@ function _single_step(
     newton_tolerance::Real=1.0e-10,
     max_newton_iterations::Integer=20,
     finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    jacobian::Symbol=:analytic,
     newton_iterations=nothing,
 )
     if method == :euler
@@ -2511,6 +3704,7 @@ function _single_step(
             newton_tolerance=newton_tolerance,
             max_newton_iterations=max_newton_iterations,
             finite_difference_epsilon=finite_difference_epsilon,
+            jacobian=jacobian,
             newton_iterations=newton_iterations,
         )
     end
@@ -2590,6 +3784,7 @@ function solve_network_adaptive(
     newton_tolerance::Real=1.0e-10,
     max_newton_iterations::Integer=20,
     finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    jacobian::Symbol=:analytic,
 )
     t_start = Float64(tspan[1])
     t_end = Float64(tspan[2])
@@ -2637,6 +3832,7 @@ function solve_network_adaptive(
                 newton_tolerance=newton_tolerance,
                 max_newton_iterations=max_newton_iterations,
                 finite_difference_epsilon=finite_difference_epsilon,
+                jacobian=jacobian,
                 newton_iterations=proposed_newton_iterations,
             )
         catch err
@@ -2721,7 +3917,7 @@ function solve_network_adaptive(
     return return_stats ? (times, history, stats) : (times, history)
 end
 
-#=
+"""
     run_monte_carlo(network, Y0, tspan, dt, rho, T9; nruns, seed=nothing, method=:rk4, store_histories=false)
 
 Run repeated single-zone network calculations with STARLIB lognormal rate
@@ -2732,7 +3928,7 @@ and held fixed for that reaction throughout the run:
 
 Returns a named tuple containing final abundances, sampled `p` values, and
 optionally all abundance histories.
-=#
+"""
 function run_monte_carlo(
     network::ReactionNetwork,
     Y0::AbstractVector{<:Real},
@@ -2792,7 +3988,7 @@ function run_monte_carlo(
     )
 end
 
-#=
+"""
     solve_single_zone(tables, labels, X0, tspan, dt, rho, T9; adaptive=true, ...)
 
 Build and run a single-zone post-processing network from user-facing inputs.
@@ -2803,7 +3999,7 @@ This is the convenience workflow for interactive use:
 - convert initial mass fractions `X0` to abundances
 - run fixed-step or adaptive integration
 - return mass-fraction diagnostics with the raw abundance history
-=#
+"""
 function solve_single_zone(
     tables::AbstractVector{ReactionRateTable},
     labels::AbstractVector{<:AbstractString},
@@ -2837,6 +4033,7 @@ function solve_single_zone(
     newton_tolerance::Real=1.0e-10,
     max_newton_iterations::Integer=20,
     finite_difference_epsilon::Real=sqrt(eps(Float64)),
+    jacobian::Symbol=:analytic,
 )
     network = network_from_labels(tables, labels; species=species, source=source, on_multiple=on_multiple)
     validation = validate ? network_validation_report(network; throw_on_error=true) : network_validation_report(network)
@@ -2874,6 +4071,7 @@ function solve_single_zone(
             newton_tolerance=newton_tolerance,
             max_newton_iterations=max_newton_iterations,
             finite_difference_epsilon=finite_difference_epsilon,
+            jacobian=jacobian,
         )
     else
         solve_network(
@@ -2891,6 +4089,7 @@ function solve_single_zone(
             newton_tolerance=newton_tolerance,
             max_newton_iterations=max_newton_iterations,
             finite_difference_epsilon=finite_difference_epsilon,
+            jacobian=jacobian,
             return_stats=true,
         )
     end
@@ -2933,6 +4132,207 @@ function solve_single_zone(
         solver_stats=solver_stats,
         adaptive=adaptive,
     )
+end
+
+"""
+    solve_network_fbdf(network, Y0, tspan, rho, T9; kwargs...)
+
+Solve the network with the variable-order stiff `FBDF` integrator from
+OrdinaryDiffEqBDF, using ReacNetJl's cached RHS and analytic Jacobian.
+Higher-order than backward Euler, so it takes far fewer steps at the same
+accuracy.
+
+This function is provided by a package extension: install and load the solver
+package first with `import Pkg; Pkg.add("OrdinaryDiffEqBDF")` and
+`using OrdinaryDiffEqBDF`. Returns `(times, history, stats)` like
+`solve_network_adaptive`. Also available through `run_ppn(...; method=:fbdf)`.
+"""
+function solve_network_fbdf(network::ReactionNetwork, Y0, tspan, rho, T9; kwargs...)
+    error("solve_network_fbdf requires the OrdinaryDiffEqBDF extension; run `import Pkg; Pkg.add(\"OrdinaryDiffEqBDF\")` and add `using OrdinaryDiffEqBDF` before calling it")
+end
+
+"""
+    run_ppn(trajectory_path, abundance_path;
+            rates=:starlib, screening=:weak, neutron_captures=true, kwargs...)
+
+Run a complete single-zone post-processing nucleosynthesis calculation from a
+trajectory file and an initial-abundance file, in one call.
+
+The pipeline is: read the trajectory and abundances, build the H-Ca nova
+network from the chosen rate library, add reverse rates, validate the
+network, and integrate the abundances over the full trajectory with the
+adaptive backward-Euler solver and analytic Jacobian.
+
+# Arguments
+- `trajectory_path`: trajectory file with `AGEUNIT`/`TUNIT`/`RHOUNIT` metadata.
+- `abundance_path`: initial abundance table (`Z name A X` rows).
+
+# Keywords
+- `rates`: `:starlib` (default) or `:iliadis2002` for the NACRE (A < 20) plus
+  Iliadis et al. 2001 (A = 20-40) REACLIB baseline of the 2002 nova
+  sensitivity study.
+- `tables`: pass a prebuilt `Vector{ReactionRateTable}` to skip library
+  loading (overrides `rates`).
+- `screening`: `nothing`, `:weak`, or `:chugunov`.
+- `neutron_captures`: include neutron-induced reactions in the network
+  selection (default `true`).
+- `partition_functions`: `:auto` (default; uses `data/winvne_v2.0.dat` when
+  present), `nothing`, or a `PartitionFunctionTable` — applied to generated
+  detailed-balance reverse rates.
+- `jacobian`: `:analytic` (default) or `:finite_difference`.
+- `method`: `:backward_euler` (default), `:euler`, `:rk4`, or `:fbdf` for the
+  high-order stiff integrator (requires `using OrdinaryDiffEqBDF`).
+- `dt_initial`, `dt_min`, `dt_max`: solver step controls; by default they are
+  chosen from the trajectory duration like the nova example driver.
+- `max_fractional_change`, `max_absolute_change`, `abundance_floor`,
+  `max_newton_iterations`, `max_steps`: adaptive controller settings,
+  defaulting to the values validated by the nova example driver.
+
+# Returns
+A named tuple with the `network`, `trajectory`, solution `times` and
+abundance `history`, `initial_mass_fractions` and `final_mass_fractions`
+dictionaries, `inert_mass_fractions` for species outside the network,
+`solver_stats`, `reverse_summary`, the `rate_policy_report` (for
+`rates=:iliadis2002`), and the network `validation` report.
+"""
+function run_ppn(
+    trajectory_path::AbstractString,
+    abundance_path::AbstractString;
+    rates::Symbol=:starlib,
+    tables=nothing,
+    screening=:weak,
+    neutron_captures::Bool=true,
+    generate_detailed_balance::Bool=true,
+    partition_functions=:auto,
+    jacobian::Symbol=:analytic,
+    method::Symbol=:backward_euler,
+    max_fractional_change::Real=0.50,
+    max_absolute_change::Real=1.0e-4,
+    abundance_floor::Real=1.0e-8,
+    max_newton_iterations::Integer=80,
+    dt_initial=nothing,
+    dt_min=nothing,
+    dt_max=nothing,
+    max_steps::Integer=1_000_000,
+)
+    trajectory = read_trajectory(trajectory_path)
+    profiles = trajectory_profiles(trajectory)
+    X_raw = read_initial_abundances(abundance_path)
+    X_normalized = read_initial_abundances(abundance_path; normalize=true)
+
+    rate_policy_report = nothing
+    if tables === nothing
+        if rates == :iliadis2002
+            selection = iliadis2002_rate_tables(; include_reverse=true)
+            tables = selection.tables
+            rate_policy_report = selection.report
+        elseif rates == :starlib
+            tables = read_starlib()
+        else
+            throw(ArgumentError("unsupported rates=$rates; use :starlib or :iliadis2002"))
+        end
+    end
+
+    projectiles = neutron_captures ? ("p", "he4", "he3", "d", "n") : ("p", "he4", "he3", "d")
+    forward_tables = select_h_ca_reaction_tables(tables, keys(X_raw); projectiles=projectiles)
+
+    pf = partition_functions
+    if pf === :auto
+        pf = isfile(DEFAULT_WINVNE_PATH) ? read_winvne() : nothing
+    end
+    reverse_summary = add_reverse_reaction_tables(
+        tables,
+        forward_tables;
+        generate_detailed_balance=generate_detailed_balance,
+        partition_functions=pf,
+    )
+    network = network_from_tables(reverse_summary.tables)
+    validation = network_validation_report(network; throw_on_error=true)
+
+    X0 = Dict(name => value for (name, value) in X_normalized if haskey(network.species_index, name))
+    inert_mass_fractions = Dict(name => value for (name, value) in X_normalized if !haskey(network.species_index, name))
+    Y0 = abundances_from_mass_fractions(network, X0)
+
+    t_start = first(trajectory.time)
+    t_end = last(trajectory.time)
+    duration = t_end - t_start
+    step_initial = dt_initial === nothing ? (duration > 100.0 ? 1.0 : 0.02) : Float64(dt_initial)
+    step_min = dt_min === nothing ? (duration > 100.0 ? 1.0e-8 : 1.0e-10) : Float64(dt_min)
+    step_max = dt_max === nothing ? (duration > 100.0 ? 20.0 : 0.05) : Float64(dt_max)
+
+    times, history, solver_stats = if method == :fbdf
+        solve_network_fbdf(
+            network,
+            Y0,
+            (t_start, t_end),
+            profiles.rho,
+            profiles.T9;
+            screening=screening,
+        )
+    else
+        solve_network_adaptive(
+            network,
+            Y0,
+            (t_start, t_end),
+            step_initial,
+            profiles.rho,
+            profiles.T9;
+            method=method,
+            screening=screening,
+            jacobian=jacobian,
+            max_fractional_change=max_fractional_change,
+            max_absolute_change=max_absolute_change,
+            abundance_floor=abundance_floor,
+            max_newton_iterations=max_newton_iterations,
+            dt_min=step_min,
+            dt_max=step_max,
+            max_steps=max_steps,
+            return_stats=true,
+        )
+    end
+
+    return (
+        network=network,
+        trajectory=trajectory,
+        times=times,
+        history=history,
+        initial_mass_fractions=mass_fractions_from_abundances(network, view(history, 1, :)),
+        final_mass_fractions=mass_fractions_from_abundances(network, view(history, size(history, 1), :)),
+        inert_mass_fractions=inert_mass_fractions,
+        mass_fraction_drift=mass_fraction_drift(network, history),
+        solver_stats=solver_stats,
+        reverse_summary=(explicit=reverse_summary.explicit, generated=reverse_summary.generated, missing=reverse_summary.missing),
+        rate_policy_report=rate_policy_report,
+        validation=validation,
+    )
+end
+
+# Precompile the solver hot path on a miniature network so first use in a
+# fresh session skips most of the compilation latency.
+@setup_workload begin
+    _pc_grid = STARLIB_T9_GRID
+    _pc_unit = ones(length(_pc_grid))
+    _pc_tables = [
+        ReactionRateTable(4, ["p", "o17"], ["f18"], "pc", 5.607, _pc_grid, fill(2.0e4, length(_pc_grid)), _pc_unit),
+        ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "pc", 2.882, _pc_grid, fill(6.0e4, length(_pc_grid)), _pc_unit),
+        ReactionRateTable(1, ["o15"], ["n15"], "pcw", 2.754, _pc_grid, fill(4.5e-3, length(_pc_grid)), _pc_unit),
+    ]
+
+    @compile_workload begin
+        _pc_network = network_from_tables(_pc_tables)
+        _pc_X0 = Dict("p" => 0.7, "o17" => 0.1, "f18" => 1.0e-4, "he4" => 0.2, "o15" => 0.0, "n15" => 0.0)
+        _pc_Y0 = abundances_from_mass_fractions(_pc_network, _pc_X0; normalize=true)
+        for _pc_screening in (nothing, :weak, :chugunov)
+            network_rhs(_pc_Y0, _pc_network, 500.0, 0.25; screening=_pc_screening)
+            solve_network_adaptive(
+                _pc_network, _pc_Y0, (0.0, 1.0e-6), 1.0e-7, 500.0, 0.25;
+                method=:backward_euler, screening=_pc_screening, return_stats=true,
+                abundance_floor=1.0e-8, max_newton_iterations=80,
+            )
+        end
+        solve_network(_pc_network, _pc_Y0, (0.0, 1.0e-7), 1.0e-8, 500.0, 0.25; method=:rk4, screening=:weak)
+        mass_fractions_from_abundances(_pc_network, _pc_Y0)
+    end
 end
 
 end # module
