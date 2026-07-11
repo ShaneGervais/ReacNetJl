@@ -1,12 +1,21 @@
 function usage()
     return """
     Usage:
-      julia --project=. examples/single_zone_nova_ppn.jl [--jobs N] [--output-stride N] [--screening weak|none] [--decay-time S] [--stop-time S] [--stop-temperature T9] [--stop-hydrogen X] [--flux-report N]
+      julia --project=. examples/single_zone_nova_ppn.jl [--jobs N] [--rates starlib|iliadis2002] [--output-stride N] [--screening weak|none] [--decay-time S] [--stop-time S] [--stop-temperature T9] [--stop-hydrogen X] [--flux-report N]
 
     Options:
       --jobs N           Number of Julia threads to use for threaded Jacobian and DAT output work.
+      --rates MODE       Rate library: starlib, or iliadis2002 for the NACRE (A<20) plus
+                         Iliadis 2001 (A=20-40) baseline of the 2002 sensitivity study,
+                         using the tabulated paper rates where extracted.
+                         Default: starlib, or NOVA_PPN_RATES.
+      --trajectory PATH  Trajectory file to use instead of the project-root trajectory.input.
+                         Default: NOVA_PPN_TRAJECTORY or trajectory.input.
+      --no-neutron-captures
+                         Exclude neutron-induced reactions from the network selection.
       --output-stride N  Write every Nth trajectory output state. Default: 1, or NOVA_PPN_OUTPUT_STRIDE.
-      --screening MODE   Screening model: weak or none. Default: weak, or NOVA_PPN_SCREENING.
+      --screening MODE   Screening model: weak, chugunov, or none. Default: weak, or NOVA_PPN_SCREENING.
+                         chugunov = Chugunov, DeWitt & Yakovlev (2007), valid into the strong-screening regime.
       --no-screening     Alias for --screening none.
       --decay-time S     Evolve weak decays for S seconds after the final state and write iso_massfDECAY.DAT.
       --stop-time S      Stop the network at absolute trajectory time S seconds.
@@ -22,11 +31,13 @@ function screening_model_from_name(value)
     name = lowercase(strip(string(value)))
     if name == "weak"
         return :weak
+    elseif name == "chugunov"
+        return :chugunov
     elseif name in ("none", "off", "false", "no")
         return nothing
     end
 
-    throw(ArgumentError("unsupported screening '$value'; use weak or none"))
+    throw(ArgumentError("unsupported screening '$value'; use weak, chugunov, or none"))
 end
 
 function screening_label(screening_model)
@@ -41,8 +52,18 @@ function parse_optional_float_env(name::AbstractString)
     return parse(Float64, value)
 end
 
+function rates_mode_from_name(value)
+    name = lowercase(strip(string(value)))
+    name in ("starlib",) && return :starlib
+    name in ("iliadis2002", "iliadis", "reaclib2002") && return :iliadis2002
+    throw(ArgumentError("unsupported rates mode '$value'; use starlib or iliadis2002"))
+end
+
 function parse_cli_args(args)
     jobs = 1
+    rates = rates_mode_from_name(get(ENV, "NOVA_PPN_RATES", "starlib"))
+    trajectory = get(ENV, "NOVA_PPN_TRAJECTORY", "")
+    neutron_captures = get(ENV, "NOVA_PPN_NEUTRON_CAPTURES", "1") != "0"
     output_stride = parse(Int, get(ENV, "NOVA_PPN_OUTPUT_STRIDE", "1"))
     screening = screening_model_from_name(get(ENV, "NOVA_PPN_SCREENING", "weak"))
     decay_time_s = parse(Float64, get(ENV, "NOVA_PPN_DECAY_TIME", "0.0"))
@@ -62,6 +83,23 @@ function parse_cli_args(args)
             i += 2
         elseif startswith(arg, "--jobs=")
             jobs = parse(Int, split(arg, "="; limit=2)[2])
+            i += 1
+        elseif arg == "--rates"
+            i < length(args) || throw(ArgumentError("--rates requires starlib or iliadis2002"))
+            rates = rates_mode_from_name(args[i + 1])
+            i += 2
+        elseif startswith(arg, "--rates=")
+            rates = rates_mode_from_name(split(arg, "="; limit=2)[2])
+            i += 1
+        elseif arg == "--no-neutron-captures"
+            neutron_captures = false
+            i += 1
+        elseif arg == "--trajectory"
+            i < length(args) || throw(ArgumentError("--trajectory requires a file path"))
+            trajectory = args[i + 1]
+            i += 2
+        elseif startswith(arg, "--trajectory=")
+            trajectory = split(arg, "="; limit=2)[2]
             i += 1
         elseif arg == "--output-stride"
             i < length(args) || throw(ArgumentError("--output-stride requires an integer value"))
@@ -129,6 +167,9 @@ function parse_cli_args(args)
     flux_report_count >= 0 || throw(ArgumentError("--flux-report must be non-negative"))
     return (
         jobs=jobs,
+        rates=rates,
+        trajectory=isempty(strip(trajectory)) ? nothing : String(strip(trajectory)),
+        neutron_captures=neutron_captures,
         output_stride=output_stride,
         screening=screening,
         decay_time_s=decay_time_s,
@@ -143,8 +184,7 @@ function maybe_relaunch_with_threads(cli)
     cli.jobs <= Base.Threads.nthreads() && return
     get(ENV, "REACNETJL_PPN_RELAUNCHED", "0") == "1" && return
 
-    project = Base.active_project()
-    project_dir = project === nothing ? dirname(@__DIR__) : dirname(project)
+    project_dir = dirname(@__DIR__)
     env = copy(ENV)
     env["REACNETJL_PPN_RELAUNCHED"] = "1"
     env["JULIA_NUM_THREADS"] = string(cli.jobs)
@@ -155,6 +195,13 @@ end
 
 const CLI = parse_cli_args(ARGS)
 maybe_relaunch_with_threads(CLI)
+
+# Activate the ReacNetJl project when the script is launched without
+# `--project=...`, so `julia single_zone_nova_ppn.jl` works from any directory.
+if Base.find_package("ReacNetJl") === nothing
+    import Pkg
+    Pkg.activate(dirname(@__DIR__); io=devnull)
+end
 
 using Printf
 using ReacNetJl
@@ -894,7 +941,10 @@ function print_integrated_flux_report(
 end
 
 project_root = dirname(@__DIR__)
-trajectory_path = required_file([joinpath(project_root, "trajectory.input")], "trajectory file")
+trajectory_candidates = CLI.trajectory === nothing ?
+    [joinpath(project_root, "trajectory.input")] :
+    [CLI.trajectory, joinpath(project_root, CLI.trajectory)]
+trajectory_path = required_file(trajectory_candidates, "trajectory file")
 abundance_path = required_file(
     [joinpath(project_root, "initial_abundance.DAT"), joinpath(project_root, "initial_abundance.dat")],
     "initial abundance file",
@@ -905,15 +955,48 @@ template_path = template_index === nothing ? nothing : template_candidates[templ
 output_dir = joinpath(project_root, "outputs", "single_zone_nova_ppn")
 output_stride = CLI.output_stride
 
-tables = read_starlib()
+rate_policy_report = nothing
+if CLI.rates == :iliadis2002
+    rate_selection = iliadis2002_rate_tables(; include_reverse=true)
+    tables = rate_selection.tables
+    rate_policy_report = rate_selection.report
+else
+    tables = read_starlib()
+end
+
 trajectory = read_trajectory(trajectory_path)
 profiles = trajectory_profiles(trajectory)
 raw_X_file = read_initial_abundances(abundance_path)
 X_file = read_initial_abundances(abundance_path; normalize=true)
-forward_tables = select_h_ca_reaction_tables(tables, keys(raw_X_file))
-reverse_summary = add_reverse_reaction_tables(tables, forward_tables; generate_detailed_balance=true)
+projectiles = CLI.neutron_captures ? ("p", "he4", "he3", "d", "n") : ("p", "he4", "he3", "d")
+forward_tables = select_h_ca_reaction_tables(tables, keys(raw_X_file); projectiles=projectiles)
+partition_functions = isfile(ReacNetJl.DEFAULT_WINVNE_PATH) ? read_winvne() : nothing
+reverse_summary = add_reverse_reaction_tables(
+    tables,
+    forward_tables;
+    generate_detailed_balance=true,
+    partition_functions=partition_functions,
+)
 network = network_from_tables(reverse_summary.tables)
 validation = network_validation_report(network; throw_on_error=true)
+
+@printf("rate library        = %s\n", CLI.rates)
+@printf("projectiles         = %s\n", join(projectiles, ", "))
+@printf("partition functions = %s\n", partition_functions === nothing ? "none (run data/download_rates.sh for winvne)" : "winvne (spin + G(T9) in generated reverse rates)")
+if rate_policy_report !== nothing
+    @printf("rate policy counts  = %s\n", join(["$k: $v" for (k, v) in sort(collect(rate_policy_report.counts))], ", "))
+end
+
+# Rate provenance for the reactions actually selected into the network.
+active_source_counts = Dict{String,Int}()
+for table in forward_tables
+    active_source_counts[table.source] = get(active_source_counts, table.source, 0) + 1
+end
+top_sources = sort(collect(active_source_counts); by=last, rev=true)
+@printf("active network rate sources (top %d of %d):\n", min(12, length(top_sources)), length(top_sources))
+for (source, count) in top_sources[1:min(12, length(top_sources))]
+    @printf("  %-10s %4d reactions\n", source, count)
+end
 
 trajectory_start_time = first(trajectory.time)
 trajectory_end_time = last(trajectory.time)
