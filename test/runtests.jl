@@ -715,3 +715,457 @@ end
     @test unsupported_report.unsupported_by_chapter[11] == 1
     @test isempty(only(unsupported_tables).products)
 end
+
+using Printf
+
+@testset "REACLIB parsing, evaluation, and Iliadis-2002 policy" begin
+    reaclib_header(species, label, res, rev, q) =
+        " "^5 * join([lpad(s, 5) for s in vcat(species, fill("", 6 - length(species)))], "") *
+        " "^8 * lpad(label, 4) * res * rev * " "^3 * @sprintf("%12.5e", q)
+    reaclib_coefficients(a) =
+        join([@sprintf("%13.6e", x) for x in a[1:4]], "") * "\n" *
+        join([@sprintf("%13.6e", x) for x in a[5:7]], "")
+    reaclib_set(chapter, species, label, res, rev, q, a) =
+        string(chapter) * "\n" * reaclib_header(species, label, res, rev, q) * "\n" * reaclib_coefficients(a)
+
+    fixture = join([
+        # p + o17 -> he4 + n14: nacr non-resonant + resonant sets, plus an il01 alternative
+        reaclib_set(5, ["p", "o17", "he4", "n14"], "nacr", 'n', ' ', 1.1917, (2.0, 0, 0, 0, 0, 0, 0)),
+        reaclib_set(5, ["p", "o17", "he4", "n14"], "nacr", 'r', ' ', 1.1917, (1.0, 0, 0, 0, 0, 0, 0)),
+        reaclib_set(5, ["p", "o17", "he4", "n14"], "il01", 'n', ' ', 1.1917, (0.5, 0, 0, 0, 0, 0, 0)),
+        # p + ne20 -> na21: il01 and nacr alternatives
+        reaclib_set(4, ["p", "ne20", "na21"], "il01", 'n', ' ', 2.431, (1.5, 0, 0, 0, 0, 0, 0)),
+        reaclib_set(4, ["p", "ne20", "na21"], "nacr", 'n', ' ', 2.431, (1.0, 0, 0, 0, 0, 0, 0)),
+        # reverse fits for both labels; only the chosen il01 one may be imported
+        reaclib_set(2, ["na21", "p", "ne20"], "il01", 'n', 'v', -2.431, (3.0, 0, 0, 0, 0, 0, 0)),
+        reaclib_set(2, ["na21", "p", "ne20"], "nacr", 'n', 'v', -2.431, (2.5, 0, 0, 0, 0, 0, 0)),
+        # weak decay and an uncompiled fallback label
+        reaclib_set(1, ["f18", "o18"], "wc12", 'w', ' ', 1.6555, (-9.3, 0, 0, 0, 0, 0, 0)),
+        reaclib_set(4, ["p", "f17", "ne18"], "dc11", 'n', ' ', 3.9224, (0.25, 0, 0, 0, 0, 0, 0)),
+    ], "\n") * "\n"
+
+    fixture_path = joinpath(mktempdir(), "reaclib_fixture.dat")
+    write(fixture_path, fixture)
+
+    sets = read_reaclib(fixture_path)
+    @test length(sets) == 9
+    @test sets[1].chapter == 5
+    @test sets[1].reactants == ["p", "o17"]
+    @test sets[1].products == ["he4", "n14"]
+    @test sets[1].label == "nacr"
+    @test sets[1].resonance == 'n'
+    @test !sets[1].reverse
+    @test sets[1].q_value ≈ 1.1917 atol = 1.0e-4
+    @test sets[1].coefficients[1] ≈ 2.0
+    @test sets[6].reverse
+    @test sets[8].resonance == 'w'
+
+    # analytic evaluation against the REACLIB parameterization
+    a = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0)
+    full_set = ReaclibSet(4, ["p", "ne20"], ["na21"], "test", 'n', false, 2.431, a)
+    T9 = 0.7
+    expected_exponent = a[1] + a[2] / T9 + a[3] * T9^(-1 / 3) + a[4] * T9^(1 / 3) +
+                        a[5] * T9 + a[6] * T9^(5 / 3) + a[7] * log(T9)
+    @test reaclib_rate(full_set, T9) ≈ exp(expected_exponent) rtol = 1.0e-12
+    @test_throws ArgumentError reaclib_rate(full_set, 0.0)
+
+    # grouped tables: sets of one reaction/label are summed, reverse excluded
+    tables = reaclib_rate_tables(sets)
+    @test length(tables) == 6
+    @test all(t -> length(t.T9) == 60, tables)
+    @test all(t -> all(==(1.0), t.factor_uncertainty), tables)
+
+    o17_nacr = only(find_rate(tables, "17O(p,α)14N"; source="nacr"))
+    @test o17_nacr.rate[1] ≈ exp(2.0) + exp(1.0) rtol = 1.0e-12
+    @test o17_nacr.q_value ≈ 1.1917 atol = 1.0e-4
+
+    f18_decay = only(find_rate(tables, "18F(β+)18O"))
+    @test f18_decay.source == "wc12w"
+    @test f18_decay.rate[1] ≈ exp(-9.3) rtol = 1.0e-12
+
+    nacr_only = reaclib_rate_tables(sets; labels=["nacr"])
+    @test length(nacr_only) == 2
+    @test all(t -> t.source == "nacr", nacr_only)
+
+    # Iliadis-2002 policy: nacr below A=20, il01 at and above, fallbacks reported
+    result = iliadis2002_rate_tables(sets)
+    @test only(find_rate(result.tables, "17O(p,α)14N")).source == "nacr"
+    ne20_capture = only(find_rate(result.tables, "20Ne(p,γ)21Na"))
+    @test ne20_capture.source == "il01"
+    @test ne20_capture.rate[1] ≈ exp(1.5) rtol = 1.0e-12
+    @test result.report.counts[:nacr] == 1
+    @test result.report.counts[:il01] == 1
+    @test result.report.counts[:weak] == 1
+    @test result.report.counts[:other] == 1
+    @test length(result.report.fallbacks) == 1
+    @test occursin("f17", only(result.report.fallbacks).reaction)
+    @test only(result.report.fallbacks).preferred == "nacr"
+
+    without_weak = iliadis2002_rate_tables(sets; include_weak=false)
+    @test isempty(find_rate(without_weak.tables, "18F(β+)18O"))
+
+    with_reverse = iliadis2002_rate_tables(sets; include_reverse=true)
+    na21_reverse = find_reverse_rate(with_reverse.tables, "20Ne(p,γ)21Na")
+    @test length(na21_reverse) == 1
+    @test only(na21_reverse).source == "il01v"
+    @test only(na21_reverse).rate[1] ≈ exp(3.0) rtol = 1.0e-12
+
+    # duplicated input (overlapping label files) must not double any rate
+    doubled = iliadis2002_rate_tables(vcat(sets, sets))
+    @test only(find_rate(doubled.tables, "17O(p,α)14N")).rate[1] ≈ exp(2.0) + exp(1.0) rtol = 1.0e-12
+
+    # a REACLIB table drives a network exactly like a STARLIB table
+    network = network_from_tables(find_rate(result.tables, "20Ne(p,γ)21Na"))
+    @test network.species == ["p", "ne20", "na21"]
+
+    bad_path = joinpath(mktempdir(), "bad_chapter.dat")
+    write(bad_path, "99\n" * reaclib_header(["p", "o17", "he4", "n14"], "nacr", 'n', ' ', 1.0) * "\n" * reaclib_coefficients((1.0, 0, 0, 0, 0, 0, 0)) * "\n")
+    @test_throws ErrorException read_reaclib(bad_path)
+end
+
+@testset "cached RHS and analytic Jacobian equivalence" begin
+    grid = ReacNetJl.STARLIB_T9_GRID
+    unit_uncertainty = ones(length(grid))
+    capture = ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e4, length(grid)), unit_uncertainty)
+    proton_alpha = ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e4, length(grid)), unit_uncertainty)
+    decay = ReactionRateTable(1, ["o15"], ["n15"], "testw", 2.754, grid, fill(4.5e-3, length(grid)), unit_uncertainty)
+    triple_alpha = ReactionRateTable(8, ["he4", "he4", "he4"], ["c12"], "test", 7.275, grid, fill(1.0e-9, length(grid)), unit_uncertainty)
+    network = network_from_tables([capture, proton_alpha, decay, triple_alpha])
+
+    X0 = Dict(
+        "p" => 0.6, "o17" => 0.05, "f18" => 1.0e-4, "he4" => 0.3,
+        "o15" => 1.0e-5, "n15" => 0.0, "c12" => 0.05,
+    )
+    Y = abundances_from_mass_fractions(network, X0; normalize=true)
+    rho, T9 = 500.0, 0.25
+    multipliers = [1.0, 2.5, 1.0, 0.7]
+
+    for screening in (nothing, :weak), rate_multipliers in (nothing, multipliers)
+        reference = network_rhs(Y, network, rho, T9; screening=screening, rate_multipliers=rate_multipliers)
+        cache = ReacNetJl._build_step_cache(network, rho, T9; screening=screening, rate_multipliers=rate_multipliers)
+        fast = ReacNetJl._cached_network_rhs!(similar(Y), network, cache, Y)
+        @test isapprox(fast, reference; rtol=1.0e-12, atol=1.0e-300)
+    end
+
+    # custom screening functions cannot be cached and must fall back
+    @test ReacNetJl._build_step_cache(network, rho, T9; screening=(n, r, y, d, t) -> 2.0) === nothing
+
+    # analytic Jacobian against a central finite difference of the reference RHS
+    n = length(Y)
+    function fd_jacobian(screening)
+        J = Matrix{Float64}(undef, n, n)
+        for j in 1:n
+            h = 1.0e-6 * max(abs(Y[j]), 1.0e-8)
+            Y_plus = copy(Y); Y_plus[j] += h
+            Y_minus = copy(Y); Y_minus[j] -= h
+            column = (network_rhs(Y_plus, network, rho, T9; screening=screening) .-
+                      network_rhs(Y_minus, network, rho, T9; screening=screening)) ./ (2.0 * h)
+            J[:, j] .= column
+        end
+        return J
+    end
+
+    # without screening the analytic Jacobian is exact: only FD truncation error
+    cache_unscreened = ReacNetJl._build_step_cache(network, rho, T9)
+    J_analytic_unscreened = ReacNetJl._cached_network_jacobian!(Matrix{Float64}(undef, n, n), network, cache_unscreened, Y)
+    scale_unscreened = maximum(abs, J_analytic_unscreened)
+    @test maximum(abs, J_analytic_unscreened .- fd_jacobian(nothing)) <= 1.0e-6 * scale_unscreened
+
+    # with screening the analytic Jacobian deliberately freezes the screening
+    # factor with respect to Y (a valid Newton iteration matrix; the converged
+    # answer is set by the exact residual), so the FD reference differs by the
+    # small screening-derivative terms.
+    cache = ReacNetJl._build_step_cache(network, rho, T9; screening=:weak)
+    J_analytic = ReacNetJl._cached_network_jacobian!(Matrix{Float64}(undef, n, n), network, cache, Y)
+    scale = maximum(abs, J_analytic)
+    @test maximum(abs, J_analytic .- fd_jacobian(:weak)) <= 1.0e-2 * scale
+
+    # repeated-reactant derivative: triple-alpha column d(dY_he4/dt)/dY_he4 = -9 * pref * Y^2
+    he4 = network.species_index["he4"]
+    c12 = network.species_index["c12"]
+    triple_index = findfirst(r -> r.reactants == ["he4", "he4", "he4"], network.reactions)
+    prefactor = cache.prefactors[triple_index]
+    screen = ReacNetJl._cached_screening_multiplier(
+        network.compiled_reactions[triple_index],
+        ReacNetJl._screening_zeta_scale(cache, network, Y),
+    )
+    expected_he4_he4 = -9.0 * prefactor * screen * Y[he4]^2
+    @test isapprox(J_analytic[he4, he4], expected_he4_he4; rtol=1.0e-10)
+    @test isapprox(J_analytic[c12, he4], 3.0 * prefactor * screen * Y[he4]^2; rtol=1.0e-10)
+
+    # full solves: analytic and finite-difference Jacobians must agree
+    tspan = (0.0, 2.0e4)
+    for screening in (nothing, :weak)
+        t_a, h_a, s_a = solve_network_adaptive(
+            network, Y, tspan, 1.0, rho, T9;
+            method=:backward_euler, screening=screening, return_stats=true,
+            jacobian=:analytic, dt_max=50.0,
+        )
+        t_f, h_f, s_f = solve_network_adaptive(
+            network, Y, tspan, 1.0, rho, T9;
+            method=:backward_euler, screening=screening, return_stats=true,
+            jacobian=:finite_difference, dt_max=50.0,
+        )
+        @test isapprox(h_a[end, :], h_f[end, :]; rtol=1.0e-6, atol=1.0e-25)
+    end
+
+    # with unbounded dt the controller can push I - dt*J to numerical
+    # singularity along conserved directions; the solver must treat that as a
+    # rejected step and finish instead of crashing
+    times_unbounded, history_unbounded, stats_unbounded = solve_network_adaptive(
+        network, Y, tspan, 1.0, rho, T9;
+        method=:backward_euler, return_stats=true, jacobian=:analytic,
+    )
+    @test times_unbounded[end] ≈ tspan[2]
+    @test all(isfinite, history_unbounded)
+
+    # fixed-step path and explicit methods still run through the cache; the
+    # step sizes respect the fixture's fastest burning timescale (~5e-8 s),
+    # since fixed-step integration cannot leap it the way the adaptive
+    # controller can
+    times_fixed, history_fixed = solve_network(network, Y, (0.0, 1.0e-6), 1.0e-7, rho, T9; method=:backward_euler, screening=:weak)
+    @test all(isfinite, history_fixed)
+    times_rk4, history_rk4 = solve_network(network, Y, (0.0, 1.0e-7), 1.0e-8, rho, T9; method=:rk4, screening=:weak)
+    @test all(isfinite, history_rk4)
+    @test_throws ArgumentError solve_network(network, Y, (0.0, 1.0e-6), 1.0e-7, rho, T9; method=:backward_euler, jacobian=:bogus)
+end
+
+@testset "partition functions and Chugunov screening" begin
+    # synthetic winvne fixture: title, packed grid line, directory, records
+    winvne_lines = String[]
+    push!(winvne_lines, "")
+    push!(winvne_lines, "010015020030040050060070080090100150200250300350400450500600700800900100")
+    append!(winvne_lines, ["    p", " ne20", " na21"])
+    grid_ones = join(fill("  1.00000E+0", 8), "")
+    grid_gs = ["  1.00000E+0", "  1.00000E+0", "  1.00000E+0", "  1.00000E+0",
+               "  1.00000E+0", "  1.00000E+0", "  1.00000E+0", "  1.00000E+0"]
+    push!(winvne_lines, "    p       1.000   1   0   0.5     7.289 ame11")
+    append!(winvne_lines, [grid_ones, grid_ones, grid_ones])
+    push!(winvne_lines, " ne20      20.000  10  10   0.0    -7.042 ame11")
+    append!(winvne_lines, [grid_ones, grid_ones, grid_ones])
+    # na21 with a mildly temperature-dependent G, G(10 GK) = 2
+    push!(winvne_lines, " na21      21.000  11  10   1.5    -2.184 ame11")
+    append!(winvne_lines, [grid_ones, grid_ones, join(fill("  1.00000E+0", 7), "") * "  2.00000E+0"])
+
+    winvne_path = joinpath(mktempdir(), "winvne_fixture.dat")
+    write(winvne_path, join(winvne_lines, "\n") * "\n")
+    pf = read_winvne(winvne_path)
+
+    @test pf.g0["p"] == 2.0
+    @test pf.g0["ne20"] == 1.0
+    @test pf.g0["na21"] == 4.0
+    @test ReacNetJl._partition_function_at(pf, "na21", 10.0) == 2.0
+    @test ReacNetJl._partition_function_at(pf, "na21", 0.05) == 1.0
+    @test ReacNetJl._partition_function_at(pf, "sr90", 1.0) === nothing
+
+    grid = ReacNetJl.STARLIB_T9_GRID
+    forward = ReactionRateTable(4, ["p", "ne20"], ["na21"], "test", 2.431, grid, fill(1.0e3, length(grid)), ones(length(grid)))
+    plain = generated_detailed_balance_reverse_table(forward)
+    corrected = generated_detailed_balance_reverse_table(forward; partition_functions=pf)
+
+    # spin factor ga*gb/gc = 2*1/4 = 0.5 everywhere; pf ratio 1/G_c
+    i_low = findfirst(==(0.2), grid)
+    @test corrected.rate[i_low] ≈ 0.5 * plain.rate[i_low] rtol = 1.0e-12
+    i_high = findfirst(==(10.0), grid)
+    @test corrected.rate[i_high] ≈ 0.5 * plain.rate[i_high] / 2.0 rtol = 1.0e-12
+
+    # Chugunov screening: sanity plus slow-path/cached-path equivalence
+    proton_alpha = ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e4, length(grid)), ones(length(grid)))
+    network = network_from_tables([forward, proton_alpha])
+    Y = abundances_from_mass_fractions(
+        network,
+        Dict("p" => 0.7, "ne20" => 0.1, "na21" => 1.0e-6, "f18" => 1.0e-4, "he4" => 0.2, "o15" => 0.0);
+        normalize=true,
+    )
+    rho, T9 = 1.0e3, 0.2
+
+    multiplier = chugunov_screening_multiplier(network, network.reactions[1], Y, rho, T9)
+    @test multiplier > 1.0
+    @test isfinite(multiplier)
+    # hotter plasma screens less
+    @test chugunov_screening_multiplier(network, network.reactions[1], Y, rho, 5.0) < multiplier
+    # weak and Chugunov agree in the weak-screening regime (hot, dilute)
+    weak_value = weak_screening_multiplier(network, network.reactions[1], Y, 10.0, 2.0)
+    chugunov_value = chugunov_screening_multiplier(network, network.reactions[1], Y, 10.0, 2.0)
+    @test isapprox(log(weak_value), log(chugunov_value); rtol=0.4)
+
+    reference = network_rhs(Y, network, rho, T9; screening=:chugunov)
+    cache = ReacNetJl._build_step_cache(network, rho, T9; screening=:chugunov)
+    fast = ReacNetJl._cached_network_rhs!(similar(Y), network, cache, Y)
+    @test isapprox(fast, reference; rtol=1.0e-12, atol=1.0e-300)
+
+    # solver accepts the new mode end to end with the analytic Jacobian; the
+    # fixed steps respect the fixture's ~1e-6 s burning timescale
+    times, history = solve_network(network, Y, (0.0, 1.0e-5), 1.0e-6, rho, T9; method=:backward_euler, screening=:chugunov)
+    @test all(isfinite, history)
+end
+
+@testset "run_ppn one-call workflow" begin
+    dir = mktempdir()
+    trajectory_path = joinpath(dir, "trajectory.input")
+    write(trajectory_path, """
+        AGEUNIT = SEC
+        TUNIT   = T9K
+        RHOUNIT = CGS
+        0.0    0.20   1.0e3
+        5.0    0.25   1.2e3
+        10.0   0.15   8.0e2
+        """)
+    abundance_path = joinpath(dir, "initial_abundance.dat")
+    write(abundance_path, """
+          1 PROT          7.0E-01
+          8 o  17         1.0E-01
+          9 f  18         1.0E-04
+          2 he  4         2.0E-01
+        """)
+
+    grid = ReacNetJl.STARLIB_T9_GRID
+    unit = ones(length(grid))
+    tables = [
+        ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e2, length(grid)), unit),
+        ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e2, length(grid)), unit),
+        ReactionRateTable(1, ["o15"], ["n15"], "testw", 2.754, grid, fill(4.5e-3, length(grid)), unit),
+    ]
+
+    result = run_ppn(trajectory_path, abundance_path; tables=tables, screening=:weak)
+    @test result.times[end] ≈ 10.0
+    @test haskey(result.final_mass_fractions, "p")
+    @test result.solver_stats.accepted_steps > 0
+    @test result.mass_fraction_drift.max_abs_drift < 1.0e-6
+    total_final = sum(values(result.final_mass_fractions))
+    @test isapprox(total_final, sum(values(result.initial_mass_fractions)); rtol=1.0e-6)
+    @test result.reverse_summary.generated + result.reverse_summary.explicit + result.reverse_summary.missing > 0
+    @test result.rate_policy_report === nothing
+end
+
+const HAS_FBDF = Base.find_package("OrdinaryDiffEqBDF") !== nothing
+HAS_FBDF && @eval using OrdinaryDiffEqBDF
+
+@testset "FBDF stiff solver extension" begin
+    if !HAS_FBDF
+        @info "OrdinaryDiffEqBDF not installed; skipping FBDF extension tests"
+        @test_skip false
+    else
+        grid = ReacNetJl.STARLIB_T9_GRID
+        unit = ones(length(grid))
+        tables = [
+            ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e2, length(grid)), unit),
+            ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e2, length(grid)), unit),
+            ReactionRateTable(1, ["o15"], ["n15"], "testw", 2.754, grid, fill(4.5e-3, length(grid)), unit),
+        ]
+        network = network_from_tables(tables)
+        X0 = Dict("p" => 0.7, "o17" => 0.1, "f18" => 1.0e-4, "he4" => 0.2, "o15" => 0.0, "n15" => 0.0)
+        Y0 = abundances_from_mass_fractions(network, X0; normalize=true)
+        rho, T9 = 1.0e3, 0.2
+        tspan = (0.0, 10.0)
+
+        times_f, history_f, stats_f = solve_network_fbdf(network, Y0, tspan, rho, T9; screening=:weak)
+        @test times_f[end] ≈ tspan[2]
+        @test all(isfinite, history_f)
+        # trace species may dip negative at the tolerance level; that noise
+        # must stay far below any physical abundance
+        @test all(>=(-1.0e-8), history_f)
+        @test stats_f.accepted_steps > 0
+
+        times_b, history_b, stats_b = solve_network_adaptive(
+            network, Y0, tspan, 1.0e-4, rho, T9;
+            method=:backward_euler, screening=:weak, return_stats=true,
+            abundance_floor=1.0e-8, max_newton_iterations=80,
+        )
+        for (i, name) in pairs(network.species)
+            a = history_f[end, i]
+            b = history_b[end, i]
+            max(a, b) > 1.0e-12 && @test isapprox(a, b; rtol=5.0e-3)
+        end
+
+        # chugunov screening works through the ODE path too
+        times_c, history_c, stats_c = solve_network_fbdf(network, Y0, tspan, rho, T9; screening=:chugunov)
+        @test all(isfinite, history_c)
+
+        @test_throws ArgumentError solve_network_fbdf(network, Y0, tspan, rho, T9; screening=(n, r, y, d, t) -> 2.0)
+    end
+end
+
+@testset "tabulated paper rates and policy override" begin
+    dir = mktempdir()
+
+    # winvne fixture for Q-values (p, ne20, na21 with real mass excesses)
+    winvne_lines = String[]
+    push!(winvne_lines, "")
+    push!(winvne_lines, "010015020030040050060070080090100150200250300350400450500600700800900100")
+    grid_ones = join(fill("  1.00000E+0", 8), "")
+    for (header, _) in [
+        ("    p       1.000   1   0   0.5     7.289 ame11", 1),
+        (" ne20      20.000  10  10   0.0    -7.042 ame11", 1),
+        (" na21      21.000  11  10   1.5    -2.184 ame11", 1),
+        (" f18       18.000   9   9   1.0     0.873 ame11", 1),
+        (" o17       17.000   8   9   2.5    -0.809 ame11", 1),
+    ]
+        push!(winvne_lines, header)
+        append!(winvne_lines, [grid_ones, grid_ones, grid_ones])
+    end
+    winvne_path = joinpath(dir, "winvne.dat")
+    write(winvne_path, join(winvne_lines, "\n") * "\n")
+    pf = read_winvne(winvne_path)
+
+    @test pf.mass_excess["p"] == 7.289
+    @test reaction_q_value(pf, ["p", "ne20"], ["na21"]) ≈ 7.289 - 7.042 + 2.184 atol = 1.0e-9
+    @test reaction_q_value(pf, ["p", "sr90"], ["na21"]) === nothing
+
+    # two-column block (il01 style) + four-column block (NACRE style) + total variant
+    rates_path = joinpath(dir, "tabulated.dat")
+    write(rates_path, """
+        # fixture
+        reaction: p ne20 -> na21 ; label: 20Ne(p,g) ; table: 3 ; variant: standard
+        0.1 1.0E-08
+        0.2 5.0E-06
+        1.0 2.0E-02
+        end
+        reaction: p o17 -> f18 ; label: 17O(p,g) ; table: 2 ; variant: standard
+        0.1 2.0E-09 1.0E-09 4.0E-09
+        0.2 3.0E-06 1.5E-06 6.0E-06
+        1.0 4.0E-02 2.0E-02 8.0E-02
+        end
+        reaction: p mg25 -> al26 ; label: 25Mg(p,g) ; table: 4 ; variant: total
+        0.1 1.0E-05
+        end
+        """)
+
+    tables = read_tabulated_rates(rates_path; source="testtab", partition_functions=pf)
+    @test length(tables) == 2
+    ne20 = only(find_rate(tables, "20Ne(p,γ)21Na"))
+    @test ne20.source == "testtab"
+    @test ne20.q_value ≈ 2.431 atol = 1.0e-3
+    @test interpolate_rate(ne20, 0.2) ≈ 5.0e-6
+    @test all(==(1.0), ne20.factor_uncertainty)
+
+    o17 = only(find_rate(tables, "17O(p,γ)18F"))
+    @test interpolate_factor_uncertainty(o17, 0.2) ≈ 2.0
+    @test o17.q_value ≈ 7.289 - 0.809 - 0.873 atol = 1.0e-9
+
+    with_total = read_tabulated_rates(rates_path; source="testtab", include_total_variants=true)
+    @test length(with_total) == 3
+
+    # policy override: paper tables replace matching REACLIB fits; the first
+    # paper table wins when two cover the same reaction
+    reaclib_header(species, label, res, rev, q) =
+        " "^5 * join([lpad(s, 5) for s in vcat(species, fill("", 6 - length(species)))], "") *
+        " "^8 * lpad(label, 4) * res * rev * " "^3 * @sprintf("%12.5e", q)
+    reaclib_coefficients(a) =
+        join([@sprintf("%13.6e", x) for x in a[1:4]], "") * "\n" *
+        join([@sprintf("%13.6e", x) for x in a[5:7]], "")
+    fixture = "4\n" * reaclib_header(["p", "ne20", "na21"], "nacr", 'n', ' ', 2.431) * "\n" *
+              reaclib_coefficients((1.0, 0, 0, 0, 0, 0, 0)) * "\n"
+    sets_path = joinpath(dir, "mini_reaclib.dat")
+    write(sets_path, fixture)
+    sets = read_reaclib(sets_path)
+
+    duplicate = ReactionRateTable(4, ["p", "ne20"], ["na21"], "secondtab", 2.431,
+        ne20.T9, fill(9.9e9, length(ne20.T9)), ones(length(ne20.T9)))
+    result = iliadis2002_rate_tables(sets; paper_tables=vcat(tables, [duplicate]))
+    @test result.report.paper_overrides.replaced == 1
+    @test result.report.paper_overrides.added == 1
+    chosen = only(find_rate(result.tables, "20Ne(p,γ)21Na"))
+    @test chosen.source == "testtab"
+    @test interpolate_rate(chosen, 0.2) ≈ 5.0e-6
+end
