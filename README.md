@@ -58,11 +58,67 @@ Implemented so far:
 - one-call single-zone post-processing from reaction labels and mass fractions
 - full trajectory-indexed PPN abundance output as `iso_massfXXXXX.DAT` files plus a wide mass-fraction CSV
 - threaded finite-difference Jacobian construction for backward Euler when Julia is started with multiple threads
-- tests for parsing, interpolation, fluxes, RHS calculation, time evolution, and user-facing workflows
+- JINA REACLIB reading (`read_reaclib`), analytic fit evaluation (`reaclib_rate`), and evaluation onto the STARLIB temperature grid (`reaclib_rate_tables`)
+- Iliadis-2002 baseline rate policy (`iliadis2002_rate_tables`): NACRE for A < 20, Iliadis et al. 2001 for A = 20-40, with weak rates, fallback labels, and a full provenance report
+- per-step rate caching and an analytic Jacobian for backward Euler (`jacobian=:analytic`, the default; `:finite_difference` retained for validation)
+- winvne nuclear data import (`read_winvne`): ground-state spins and partition functions applied to generated detailed-balance reverse rates
+- Chugunov, DeWitt & Yakovlev (2007) screening (`screening=:chugunov`), valid from the weak- into the strong-screening regime, alongside the Salpeter `:weak` option
+- one-call `run_ppn(trajectory, abundances; rates=..., screening=...)` post-processing API
+- optional high-order stiff integration via the OrdinaryDiffEqBDF package extension (`solve_network_fbdf`, `run_ppn(...; method=:fbdf)`)
+- a PrecompileTools workload so fresh sessions start with the solver hot path already compiled
+- REPL docstrings for the public API (`?run_ppn`, `?iliadis2002_rate_tables`, ...)
+- tests for parsing, interpolation, fluxes, RHS calculation, time evolution, solver equivalence, and user-facing workflows
+
+## Reaction-rate data
+
+All rate libraries live in `data/` (see `data/README.md`). The large files are
+not tracked by Git; fetch the REACLIB files with:
+
+```sh
+./data/download_rates.sh
+```
+
+Two rate sources are supported:
+
+- **STARLIB** (`data/starlib.dat`): tabulated rates with factor uncertainties,
+  used for Monte Carlo uncertainty sampling.
+- **JINA REACLIB**: analytic fits evaluated onto the STARLIB temperature grid.
+  `data/reaclib_v1.0.dat` is the frozen ReaclibV1.0 snapshot,
+  `data/reaclib_il01.dat` and `data/reaclib_nacr.dat` are the complete
+  Iliadis 2001 and NACRE fit sets held by the JINA database.
+
+The Iliadis et al. (2002, ApJS 142, 105) nova baseline is built with:
+
+```julia
+using ReacNetJl
+
+result = iliadis2002_rate_tables()   # NACRE A<20, Iliadis 2001 A=20-40
+result.report.counts                 # tables per category: :nacr, :il01, :weak, :other
+result.report.fallbacks              # reactions outside both compilations
+```
+
+Every returned table records its REACLIB set label in `table.source`
+(`"nacr"`, `"il01"`, `"wc12w"`, ...), so rate provenance stays explicit all the
+way into the network.
 
 ## Quick single-zone workflow
 
-For interactive post-processing, the highest-level API is `solve_single_zone`:
+The highest-level API is `run_ppn`, which takes a trajectory file and an
+initial-abundance file and runs the full pipeline (network selection, reverse
+rates, validation, adaptive implicit solve):
+
+```julia
+using ReacNetJl
+
+result = run_ppn("trajectory.input", "initial_abundance.dat";
+                 rates=:iliadis2002, screening=:chugunov)
+
+result.final_mass_fractions
+result.solver_stats
+result.rate_policy_report.counts
+```
+
+For label-driven interactive experiments, use `solve_single_zone`:
 
 ```julia
 using ReacNetJl
@@ -203,6 +259,17 @@ For a quick formatting check without writing every trajectory state:
 julia --project=. examples/single_zone_nova_ppn.jl --output-stride 100
 ```
 
+To run with the Iliadis-2002 REACLIB baseline instead of STARLIB:
+
+```sh
+julia --project=. examples/single_zone_nova_ppn.jl --rates iliadis2002
+```
+
+Neutron-induced reactions are included in the network selection by default;
+pass `--no-neutron-captures` to exclude them. The driver prints the rate
+library, the projectile list, the policy category counts, and the source-label
+histogram of the reactions actually selected into the active network.
+
 Useful comparison and diagnostic options:
 
 ```sh
@@ -230,12 +297,14 @@ Current physics scope:
 
 Known limits:
 
-- Reverse-rate synthesis is intentionally conservative. Full reciprocal-rule
-  support still needs partition functions/statistical weights and better
-  provenance checks.
-- Strong/intermediate screening regimes are not implemented. The current
-  `screening=:weak` option is an approximate Salpeter-style weak-screening
-  multiplier.
+- Generated detailed-balance reverse rates include spin factors and
+  partition-function ratios when `data/winvne_v2.0.dat` is present; without
+  it they fall back to the mass-factor/Boltzmann approximation. Explicit
+  reverse rates from the libraries are always preferred.
+- `screening=:chugunov` covers the weak-to-strong regimes following Chugunov,
+  DeWitt & Yakovlev (2007); `screening=:weak` remains the Salpeter-style
+  multiplier for comparisons. Electron degeneracy corrections beyond that
+  prescription are not modeled.
 - Energy feedback coupling is out of scope for standard single-zone PPN. It
   would require a separate self-heating one-zone mode with `dT/dt =
   (epsilon_nuc - losses) / c_P`, an equation of state, heat capacity, and an
@@ -322,14 +391,19 @@ coverage with better data where needed.
 
 Tasks:
 
-- Add a rate provenance report for the nova example: STARLIB source tag,
-  explicit reverse rate, generated reverse rate, or unavailable.
-- Identify the h-burning and He-burning reactions whose STARLIB rates are
-  missing or clearly not suitable for the Iliadis baseline.
-- Add an import path for supplemental Reaclib rates without replacing STARLIB
-  as the primary source.
-- Prefer explicit reverse rates from data when available; use generated
-  detailed-balance rates only when the reaction class and metadata are safe.
+- Done: REACLIB import path (`read_reaclib`, `reaclib_rate_tables`) and the
+  `iliadis2002_rate_tables` policy with per-reaction provenance reporting.
+- Done: the PPN driver prints the source-label histogram of the active
+  network and prefers explicit REACLIB reverse fits of the chosen label over
+  generated detailed-balance rates in `--rates iliadis2002` mode.
+- Done: the compilation coverage gap is closed with tabulated rates extracted
+  from the papers themselves (`data/iliadis2001_rates.dat`, all 55 reactions;
+  `data/nacre_rates.dat`, 72 of 86 with lower/upper limits as factor
+  uncertainties), cross-validated against the independent JINA fits and
+  applied as `il01tab`/`nacrtab` overrides by `iliadis2002_rate_tables()`.
+  See `data/README.md` for the validation methodology.
+- Open: identify the h-burning and He-burning reactions whose STARLIB rates
+  are missing or clearly not suitable for the Iliadis baseline.
 
 ### Milestone 4: Post-decay policy
 
@@ -353,8 +427,16 @@ preserving transparent diagnostics.
 
 Tasks:
 
-- Replace dense finite-difference Jacobians with sparse or structured Jacobian
-  assembly.
+- Done: analytic Jacobian assembly with per-step rate caching replaces the
+  finite-difference default (`examples/benchmark_solver.jl` measured a
+  ~360x speedup on the 144-species nova network; `jacobian=:finite_difference`
+  remains for validation).
+- Done: optional FBDF stiff integration as a package extension. Install the
+  solver once with `import Pkg; Pkg.add("OrdinaryDiffEqBDF")`, then
+  `using OrdinaryDiffEqBDF` enables `solve_network_fbdf` and
+  `run_ppn(...; method=:fbdf)`. Plain ReacNetJl carries no heavy solver
+  dependencies.
+- Move to sparse factorization once networks exceed a few hundred species.
 - Add optional flux-history and energy-history CSV outputs beside the
   mass-fraction CSV.
 - Track Newton failure modes by timestep, temperature, density, and dominant
