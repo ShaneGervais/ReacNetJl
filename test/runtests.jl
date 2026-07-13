@@ -1169,3 +1169,108 @@ end
     @test chosen.source == "testtab"
     @test interpolate_rate(chosen, 0.2) ≈ 5.0e-6
 end
+
+@testset "AME2020 mass excesses" begin
+    dir = mktempdir()
+    ame_path = joinpath(dir, "ame_fixture.txt")
+    # verbatim rows from mass.mas20.txt, incl. an estimated (#) entry
+    write(ame_path, """
+        header line one
+        1N-Z    N    Z   A  EL    O     MASS EXCESS
+        0  1    1    0    1  n         8071.31806     0.00044       0.0        0.0     B-    782.3470     0.0004    1 008664.91590     0.00047
+          -1    0    1    1 H          7288.971064    0.000013      0.0        0.0     B-      *                    1 007825.031898    0.000014
+        0  0    1    1    2 H         13135.722895    0.000015   1112.2831     0.0002  B-      *                    2 014101.777844    0.000015
+          -3    0    3    3 Li  -pp   28667#       2000#        -2267#       667#      B-      *                    3 030775#       2147#
+        0  2   11    9   20 F         -17.463         3.116     6987.9782     0.1558   B-   7025.4550     3.1201   19 999981.252      3.345
+        """)
+    masses = read_ame_masses(ame_path)
+    @test masses["n"] ≈ 8.07131806
+    @test masses["p"] ≈ 7.288971064
+    @test masses["d"] ≈ 13.135722895
+    @test masses["li3"] ≈ 28.667          # estimated entry kept by default
+    @test masses["f20"] ≈ -0.017463
+    strict = read_ame_masses(ame_path; include_estimated=false)
+    @test !haskey(strict, "li3")
+    @test reaction_q_value(masses, ["p", "p"], ["d"]) ≈ 2 * 7.288971064 - 13.135722895 atol = 1.0e-9
+end
+
+@testset "CSV outputs (mass fractions, fluxes, network) and run_ppn(output_dir=...)" begin
+    grid = ReacNetJl.STARLIB_T9_GRID
+    unit = ones(length(grid))
+    tables = [
+        ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e2, length(grid)), unit),
+        ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e2, length(grid)), unit),
+        ReactionRateTable(1, ["o15"], ["n15"], "testw", 2.754, grid, fill(4.5e-3, length(grid)), unit),
+    ]
+    network = network_from_tables(tables)
+    Y0 = abundances_from_mass_fractions(
+        network, Dict("p" => 0.7, "o17" => 0.1, "f18" => 1.0e-4, "he4" => 0.2, "o15" => 0.0, "n15" => 0.0); normalize=true,
+    )
+    times, history = solve_network_adaptive(network, Y0, (0.0, 5.0), 1.0e-4, 1.0e3, 0.2; method=:backward_euler, screening=:weak)
+
+    dir = mktempdir()
+    mf_path = write_mass_fraction_csv(joinpath(dir, "mf.csv"), network, times, history)
+    lines = readlines(mf_path)
+    @test split(lines[1], ",") == vcat(["time_s"], network.species)
+    @test length(lines) == length(times) + 1
+    parsed_first_row = parse.(Float64, split(lines[2], ",")[2:end])
+    X_first = mass_fractions_from_abundances(network, view(history, 1, :))
+    @test isapprox(parsed_first_row, [X_first[name] for name in network.species]; rtol=1.0e-12)
+
+    flux_history = reaction_flux_history(network, history, times, 1.0e3, 0.2; screening=:weak)
+    flux_path = write_reaction_flux_csv(joinpath(dir, "flux.csv"), network, times, flux_history)
+    flux_lines = readlines(flux_path)
+    @test length(flux_lines) == length(times) + 1
+    # a reaction label with a comma (e.g. "17O(p,γ)18F") must round-trip as one quoted field
+    header_fields = split(flux_lines[1], r",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)")
+    @test length(header_fields) == length(network.reactions) + 1
+    @test any(f -> occursin("(p,", f), header_fields)
+
+    net_path = write_network_csv(joinpath(dir, "network.csv"), network)
+    net_lines = readlines(net_path)
+    @test length(net_lines) == length(network.reactions) + 1
+    @test net_lines[1] == "index,reaction,reactants,products,chapter,source,q_value_mev"
+
+    # end-to-end via run_ppn(output_dir=...)
+    traj_path = joinpath(dir, "trajectory.input")
+    write(traj_path, "AGEUNIT = SEC\nTUNIT = T9K\nRHOUNIT = CGS\n0.0 0.20 1.0e3\n5.0 0.20 1.0e3\n")
+    ab_path = joinpath(dir, "initial_abundance.dat")
+    write(ab_path, "  1 PROT 7.0E-01\n  8 o  17 1.0E-01\n  9 f  18 1.0E-04\n  2 he  4 2.0E-01\n")
+    out_dir = joinpath(dir, "run_ppn_out")
+
+    result = run_ppn(traj_path, ab_path; tables=tables, screening=:weak, output_dir=out_dir)
+    @test result.output_files.mass_fractions == joinpath(out_dir, "mass_fractions.csv")
+    @test isfile(result.output_files.mass_fractions)
+    @test isfile(result.output_files.reaction_fluxes)
+    @test isfile(result.output_files.network)
+
+    no_flux_result = run_ppn(traj_path, ab_path; tables=tables, screening=:weak, output_dir=out_dir, write_reaction_fluxes=false)
+    @test no_flux_result.output_files.reaction_fluxes === nothing
+
+    no_output_result = run_ppn(traj_path, ab_path; tables=tables, screening=:weak)
+    @test no_output_result.output_files === nothing
+end
+
+@testset "unseen isotope requires zero special-casing" begin
+    # te132 (tellurium-132) appears nowhere else in this codebase: it is not
+    # in any rate table fixture, not in _SPECIAL_SPECIES, not in any prior
+    # test. If species_from_name/normalize_species_name ever regress into
+    # needing per-isotope entries, this is the isotope that would catch it.
+    s = species_from_name("132Te")
+    @test s == Species("te132", 52, 132)
+    @test normalize_species_name("132Te") == "te132"
+    @test species_from_name("te132") == s
+
+    # round-trips for a light, a mid-mass, and a super-heavy element, none of
+    # which are referenced by any rate table or fixture in this suite either
+    @test species_from_name("6He") == Species("he6", 2, 6)
+    @test species_from_name("91Zr") == Species("zr91", 40, 91)
+    @test species_from_name("287Fl") == Species("fl287", 114, 287)
+
+    # the only physically-motivated exception to "(Z,A) fully identifies a
+    # species" is a long-lived isomer, and it is confined to 26Al
+    ground = species_from_name("26Al")
+    isomer = species_from_name("26Alm")
+    @test (ground.Z, ground.A) == (isomer.Z, isomer.A) == (13, 26)
+    @test ground.name != isomer.name
+end
