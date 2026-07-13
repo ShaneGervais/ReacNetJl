@@ -9,8 +9,12 @@ function usage()
                          Iliadis 2001 (A=20-40) baseline of the 2002 sensitivity study,
                          using the tabulated paper rates where extracted.
                          Default: starlib, or NOVA_PPN_RATES.
-      --trajectory PATH  Trajectory file to use instead of the project-root trajectory.input.
-                         Default: NOVA_PPN_TRAJECTORY or trajectory.input.
+      --case NAME        Nova case directory under nova_cases/ to read trajectory.input and
+                         initial_abundance.dat from. Default: nova_test, or NOVA_PPN_CASE.
+      --trajectory PATH  Explicit trajectory file, overriding --case.
+                         Default: NOVA_PPN_TRAJECTORY.
+      --abundance PATH   Explicit initial abundance file, overriding --case.
+                         Default: NOVA_PPN_ABUNDANCE.
       --no-neutron-captures
                          Exclude neutron-induced reactions from the network selection.
       --output-stride N  Write every Nth trajectory output state. Default: 1, or NOVA_PPN_OUTPUT_STRIDE.
@@ -62,7 +66,9 @@ end
 function parse_cli_args(args)
     jobs = 1
     rates = rates_mode_from_name(get(ENV, "NOVA_PPN_RATES", "starlib"))
+    case = get(ENV, "NOVA_PPN_CASE", "nova_test")
     trajectory = get(ENV, "NOVA_PPN_TRAJECTORY", "")
+    abundance = get(ENV, "NOVA_PPN_ABUNDANCE", "")
     neutron_captures = get(ENV, "NOVA_PPN_NEUTRON_CAPTURES", "1") != "0"
     output_stride = parse(Int, get(ENV, "NOVA_PPN_OUTPUT_STRIDE", "1"))
     screening = screening_model_from_name(get(ENV, "NOVA_PPN_SCREENING", "weak"))
@@ -94,12 +100,26 @@ function parse_cli_args(args)
         elseif arg == "--no-neutron-captures"
             neutron_captures = false
             i += 1
+        elseif arg == "--case"
+            i < length(args) || throw(ArgumentError("--case requires a nova_cases/ directory name"))
+            case = args[i + 1]
+            i += 2
+        elseif startswith(arg, "--case=")
+            case = split(arg, "="; limit=2)[2]
+            i += 1
         elseif arg == "--trajectory"
             i < length(args) || throw(ArgumentError("--trajectory requires a file path"))
             trajectory = args[i + 1]
             i += 2
         elseif startswith(arg, "--trajectory=")
             trajectory = split(arg, "="; limit=2)[2]
+            i += 1
+        elseif arg == "--abundance"
+            i < length(args) || throw(ArgumentError("--abundance requires a file path"))
+            abundance = args[i + 1]
+            i += 2
+        elseif startswith(arg, "--abundance=")
+            abundance = split(arg, "="; limit=2)[2]
             i += 1
         elseif arg == "--output-stride"
             i < length(args) || throw(ArgumentError("--output-stride requires an integer value"))
@@ -168,7 +188,9 @@ function parse_cli_args(args)
     return (
         jobs=jobs,
         rates=rates,
+        case=String(strip(case)),
         trajectory=isempty(strip(trajectory)) ? nothing : String(strip(trajectory)),
+        abundance=isempty(strip(abundance)) ? nothing : String(strip(abundance)),
         neutron_captures=neutron_captures,
         output_stride=output_stride,
         screening=screening,
@@ -941,18 +963,26 @@ function print_integrated_flux_report(
 end
 
 project_root = dirname(@__DIR__)
+case_dir = joinpath(project_root, "nova_cases", CLI.case)
+
 trajectory_candidates = CLI.trajectory === nothing ?
-    [joinpath(project_root, "trajectory.input")] :
+    [joinpath(case_dir, "trajectory.input")] :
     [CLI.trajectory, joinpath(project_root, CLI.trajectory)]
 trajectory_path = required_file(trajectory_candidates, "trajectory file")
-abundance_path = required_file(
-    [joinpath(project_root, "initial_abundance.DAT"), joinpath(project_root, "initial_abundance.dat")],
-    "initial abundance file",
-)
-template_candidates = [joinpath(project_root, "iso_massf00804.DAT")]
+
+abundance_candidates = CLI.abundance === nothing ?
+    [joinpath(case_dir, "initial_abundance.DAT"), joinpath(case_dir, "initial_abundance.dat")] :
+    [CLI.abundance, joinpath(project_root, CLI.abundance)]
+abundance_path = required_file(abundance_candidates, "initial abundance file")
+
+template_candidates = [joinpath(case_dir, "iso_massf00804.DAT")]
 template_index = findfirst(isfile, template_candidates)
 template_path = template_index === nothing ? nothing : template_candidates[template_index]
-output_dir = joinpath(project_root, "outputs", "single_zone_nova_ppn")
+
+# Custom --trajectory/--abundance paths fall outside any nova_cases/ case, so
+# their output goes to a shared directory instead of a per-case one.
+output_slug = (CLI.trajectory === nothing && CLI.abundance === nothing) ? CLI.case : "custom"
+output_dir = joinpath(project_root, "outputs", output_slug)
 output_stride = CLI.output_stride
 
 rate_policy_report = nothing
@@ -1109,7 +1139,7 @@ println("peak epsilon_nuc = ", maximum(energy_history), " erg g^-1 s^-1")
 println("solver states = ", length(times))
 println("written trajectory states = ", length(indices), " of ", length(output_times), " (stride=", output_stride, ")")
 
-iliadis_reference_path = joinpath(project_root, "outputs", "iliadis2002_jch1", "iso_massf00000.DAT")
+iliadis_reference_path = joinpath(case_dir, "reference_iliadis2002_jch1.DAT")
 comparison_rows_for_flux = print_ppn_report(network, forward_tables, reverse_summary, X_file, history, mass_drift, trajectory, iliadis_reference_path, output_dir)
 
 if CLI.decay_time_s > 0.0

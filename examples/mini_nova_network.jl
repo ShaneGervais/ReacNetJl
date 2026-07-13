@@ -125,7 +125,7 @@ tables = read_starlib()
 network = network_from_labels(tables, labels)
 validation = network_validation_report(network; throw_on_error=true)
 
-project_trajectory_path = joinpath(dirname(@__DIR__), "trajectory.input")
+project_trajectory_path = joinpath(dirname(@__DIR__), "nova_cases", "nova_test", "trajectory.input")
 trajectory_path = isfile(project_trajectory_path) ? project_trajectory_path : joinpath(@__DIR__, "fake_nova_trajectory.dat")
 trajectory = read_trajectory(trajectory_path)
 profiles = trajectory_profiles(trajectory)
@@ -137,8 +137,8 @@ convergence_dt_limits = trajectory_duration > 100.0 ? (20.0, 10.0, 5.0) : (0.05,
 screening_model = :weak
 
 project_abundance_paths = [
-    joinpath(dirname(@__DIR__), "initial_abundance.DAT"),
-    joinpath(dirname(@__DIR__), "initial_abundance.dat"),
+    joinpath(dirname(@__DIR__), "nova_cases", "nova_test", "initial_abundance.DAT"),
+    joinpath(dirname(@__DIR__), "nova_cases", "nova_test", "initial_abundance.dat"),
 ]
 abundance_path = something(findfirst(isfile, project_abundance_paths), nothing)
 if abundance_path === nothing

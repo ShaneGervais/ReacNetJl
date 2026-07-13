@@ -4,9 +4,9 @@
 # Run from the project root (or anywhere):
 #   julia --project=. examples/benchmark_solver.jl
 #
-# The integration covers the first 1000 s of `trajectory.input` so a full
-# comparison stays affordable; both runs solve the identical problem and the
-# final mass fractions are compared at the end.
+# The integration covers the first 1000 s of the nova_test case trajectory so
+# a full comparison stays affordable; both runs solve the identical problem
+# and the final mass fractions are compared at the end.
 
 if Base.find_package("ReacNetJl") === nothing
     import Pkg
@@ -17,10 +17,11 @@ using Printf
 using ReacNetJl
 
 project_root = dirname(@__DIR__)
-trajectory = read_trajectory(joinpath(project_root, "trajectory.input"))
+case_dir = joinpath(project_root, "nova_cases", "nova_test")
+trajectory = read_trajectory(joinpath(case_dir, "trajectory.input"))
 profiles = trajectory_profiles(trajectory)
-abundance_path = isfile(joinpath(project_root, "initial_abundance.DAT")) ?
-    joinpath(project_root, "initial_abundance.DAT") : joinpath(project_root, "initial_abundance.dat")
+abundance_path = isfile(joinpath(case_dir, "initial_abundance.DAT")) ?
+    joinpath(case_dir, "initial_abundance.DAT") : joinpath(case_dir, "initial_abundance.dat")
 X_file = read_initial_abundances(abundance_path; normalize=true)
 
 tables = read_starlib()
