@@ -1,5 +1,7 @@
 # Detailed-balance reverse-rate generation.
 
+# Product of mass numbers prod_i A_i over a reaction side, the `Aa*Ab` /
+# `Ac` building block of the detailed-balance mass factor below.
 function _mass_number_factor(names::AbstractVector{String})
     factor = 1.0
     for name in names
@@ -8,6 +10,13 @@ function _mass_number_factor(names::AbstractVector{String})
     return factor
 end
 
+# Detailed balance (as implemented) only covers the simplest, most common
+# nova-network case: an exothermic two-body radiative capture a+b -> c+gamma
+# (Q>0), whose reverse is a one-body photodisintegration c+gamma -> a+b.
+# Endothermic forward reactions, or forward reactions with more than one
+# product, aren't handled by this generator (their reverse rates must come
+# from the rate library directly, or `reverse_summary.missing` reports them
+# as unavailable).
 function _can_generate_detailed_balance_reverse(table::ReactionRateTable)
     return length(table.reactants) == 2 &&
            length(table.products) == 1 &&
@@ -21,17 +30,31 @@ const GENERATED_REVERSE_RATE_FLOOR = 1.0e-300
     generated_detailed_balance_reverse_table(table; partition_functions=nothing)
 
 Generate a detailed-balance reverse table for a radiative-capture style
-two-body forward reaction `a + b -> c`:
+two-body forward reaction `a + b -> c + \\gamma`:
 
-    lambda_rev = C * T9^(3/2) * (Aa*Ab/Ac)^(3/2) * (ga*gb/gc) * (Ga*Gb/Gc)(T9)
-                 * exp(-11.605*Q/T9) * N_A<sigma v>_fwd
+```math
+\\lambda_{\\mathrm{rev}}(T_9) = C\\, T_9^{3/2} \\left(\\frac{A_a A_b}{A_c}\\right)^{3/2}
+    \\frac{g_a g_b}{g_c} \\frac{G_a(T_9) G_b(T_9)}{G_c(T_9)}\\,
+    e^{-11.605\\, Q / T_9}\\; N_A\\langle\\sigma v\\rangle_{\\mathrm{fwd}}(T_9)
+```
 
-With `partition_functions` (a `PartitionFunctionTable` from `read_winvne`)
-the spin factors `g = 2J+1` and normalized partition functions `G(T9)` are
-included; participants missing from the table fall back to `g*G = 1`.
-Without it only the mass-factor and Boltzmann terms are used, which is the
-historical approximate behavior. Prefer explicit reverse tables from the
-rate library when they exist.
+This is the standard nuclear-statistical-equilibrium detailed-balance
+relation for a photodisintegration reverse rate: at a given temperature, the
+forward capture and reverse photodisintegration rates are locked together by
+the reaction Q-value and the partition functions of the participants, so the
+reverse doesn't need its own independent measurement. `C` is
+`DETAILED_BALANCE_CAPTURE_CONSTANT` and `11.605` is
+`DETAILED_BALANCE_Q_FACTOR` (`1/k_B` in `T_9`/MeV units).
+
+With `partition_functions` (a `PartitionFunctionTable` from `read_winvne`),
+the spin factors `g = 2J+1` and normalized partition functions `G(T_9)` are
+included; participants missing from the table fall back to `g\\,G = 1`.
+Without `partition_functions`, only the mass-factor and Boltzmann terms are
+used (`g\\,G = 1` throughout), which is the historical approximate behavior --
+still qualitatively correct, but less accurate than including the real spin
+and excited-state structure. Prefer explicit reverse tables from the rate
+library when they exist (see `add_reverse_reaction_tables`); this generator is
+the fallback for reactions with no measured/tabulated reverse rate.
 """
 function generated_detailed_balance_reverse_table(
     table::ReactionRateTable;

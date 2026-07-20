@@ -122,11 +122,18 @@ end
     reaclib_rate(set, T9)
     reaclib_rate(sets, T9)
 
-Evaluate the REACLIB analytic rate parameterization
+Evaluate the standard REACLIB analytic rate parameterization,
 
-    rate = exp(a1 + a2/T9 + a3*T9^(-1/3) + a4*T9^(1/3) + a5*T9 + a6*T9^(5/3) + a7*ln(T9))
+```math
+R(T_9) = \\exp\\left(a_1 + \\frac{a_2}{T_9} + \\frac{a_3}{T_9^{1/3}} + a_4 T_9^{1/3} + a_5 T_9 + a_6 T_9^{5/3} + a_7 \\ln T_9\\right)
+```
 
-for one fit set, or the sum over a vector of sets belonging to one reaction.
+for one 7-coefficient fit `set`, or the sum over a vector of sets belonging to
+one reaction (a REACLIB rate is often the sum of a non-resonant term plus one
+or more narrow-resonance terms, each its own 7-coefficient set with the same
+reaction/label but different `resonance` flags). The exponent is capped at
+`REACLIB_EXPONENT_CAP` so evaluating a fit far outside its validated `T9`
+range gives a large finite number instead of `Inf`/`NaN`.
 """
 function reaclib_rate(set::ReaclibSet, T9::Real)
     T = Float64(T9)
@@ -144,13 +151,14 @@ end
 
 _reaclib_group_key(set::ReaclibSet) = (set.chapter, Tuple(set.reactants), Tuple(set.products), lowercase(set.label), set.reverse)
 
-#=
-Build one `ReactionRateTable` from the fit sets of a single reaction/label
-group. The source string follows the STARLIB convention of label plus flag
-suffixes, e.g. `"nacr"`, `"wc12w"`, `"nacrv"`, so weak-rate and source
-handling downstream behaves identically for STARLIB and REACLIB tables.
-REACLIB carries no rate uncertainties, so the factor uncertainty is 1.
-=#
+# Build one `ReactionRateTable` from the fit sets of a single reaction/label
+# group, by evaluating `reaclib_rate` (summed over the group) at every point
+# of `T9_grid` and flooring at `LOG_INTERPOLATION_FLOOR` (rates are
+# interpolated in log-space downstream, so a literal zero would break that).
+# The source string follows the STARLIB convention of label plus flag
+# suffixes, e.g. `"nacr"`, `"wc12w"`, `"nacrv"`, so weak-rate and source
+# handling downstream behaves identically for STARLIB and REACLIB tables.
+# REACLIB carries no rate uncertainties, so the factor uncertainty is 1.
 function _reaclib_group_table(sets::AbstractVector{ReaclibSet}, T9_grid::AbstractVector{<:Real})
     representative = first(sets)
     grid = Float64.(collect(T9_grid))

@@ -1,6 +1,9 @@
 # CSV writers for mass fractions, reaction fluxes, and the network definition.
 
 
+# Quote a CSV field per RFC 4180 if it contains a comma (reaction labels can,
+# e.g. `"p(n,γ)d"`), doubling any embedded quotes; fields without a comma are
+# left bare for readability.
 _csv_quote(s::AbstractString) = occursin(',', s) ? "\"" * replace(s, "\"" => "\"\"") * "\"" : s
 
 """

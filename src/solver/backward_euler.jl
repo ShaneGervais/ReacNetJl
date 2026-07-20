@@ -1,6 +1,29 @@
 # Implicit backward-Euler stepper with Newton iteration.
+#
+# Backward Euler solves the *implicit* update
+#
+#   Y(t+dt) = Y(t) + dt * f(Y(t+dt), t+dt)
+#
+# (contrast forward Euler's explicit Y(t)+dt*f(Y(t),t), see explicit.jl) by
+# finding the root of the residual
+#
+#   R(Y_next) = Y_next - Y - dt * f(Y_next, t+dt) = 0
+#
+# via Newton's method: at each iteration, solve the linear system
+# `J * correction = -R` for the Newton matrix `J = I - dt * df/dY` (the
+# identity from differentiating Y_next w.r.t. itself, minus dt times the
+# network's own Jacobian df/dY), then update `Y_next += correction`. This is
+# unconditionally stable for stiff systems (unlike explicit methods), which
+# is why it's the default integrator for real nova reaction networks: rate
+# multiplier differences of many orders of magnitude between fast
+# (e.g. proton captures) and slow (e.g. some weak decays) channels make the
+# network numerically stiff.
 
-
+# Newton corrections can occasionally overshoot into negative abundances
+# (unphysical); rather than reject the whole step, shrink the step along the
+# correction direction (a "damped Newton" line search) just enough that no
+# abundance goes more than 10% negative, matching how far a physical
+# solution could plausibly move in one Newton iteration.
 function _positivity_limited_alpha(Y::Vector{Float64}, correction::Vector{Float64})
     alpha = 1.0
     for i in eachindex(Y)
@@ -11,6 +34,11 @@ function _positivity_limited_alpha(Y::Vector{Float64}, correction::Vector{Float6
     return clamp(alpha, 0.0, 1.0)
 end
 
+# Clamp abundances that went negative only by a tiny amount (within `floor`
+# of zero) up to exactly zero. This is finite-precision Newton-iteration
+# noise around a true zero abundance, not a real instability; leaving it
+# slightly negative would otherwise propagate into log-scale diagnostics
+# (mass fractions, flux ratios) as spurious NaN/Inf.
 function _clamp_tiny_negative_trials!(Y::Vector{Float64}, floor::Float64)
     for i in eachindex(Y)
         if Y[i] < 0.0 && abs(Y[i]) <= floor
@@ -29,10 +57,18 @@ function Base.showerror(io::IO, err::NewtonConvergenceError)
     print(io, "backward Euler Newton iteration failed to converge after $(err.iterations) iterations; residual norm = $(err.residual_norm)")
 end
 
+# R(Y_next) = Y_next - Y - dt*f(Y_next, t_next), the backward-Euler residual
+# whose root Newton's method seeks (see the file-level comment above).
 function _backward_euler_residual(network::ReactionNetwork, Y_next::Vector{Float64}, Y::Vector{Float64}, t_next::Float64, dt::Float64, rho, T9; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     return Y_next .- Y .- dt .* _rhs_at(network, Y_next, rho, T9, t_next; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
 end
 
+# Finite-difference Jacobian dR/dY_next of the backward-Euler residual, one
+# perturbed column at a time (in parallel across Julia threads): column j is
+# `(R(Y_next + eps*e_j) - R(Y_next)) / eps`. Retained mainly for validating
+# `jacobian=:analytic` (the default and much faster path, an ~360x speedup
+# on the 144-species nova network per `examples/benchmark_solver.jl`, since
+# it avoids one extra full network RHS evaluation per species).
 function _backward_euler_jacobian(network::ReactionNetwork, Y_next::Vector{Float64}, residual::Vector{Float64}, Y::Vector{Float64}, t_next::Float64, dt::Float64, rho, T9, finite_difference_epsilon::Float64; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     n = length(Y_next)
     jacobian = Matrix{Float64}(undef, n, n)
@@ -49,6 +85,20 @@ function _backward_euler_jacobian(network::ReactionNetwork, Y_next::Vector{Float
     return jacobian
 end
 
+# One implicit backward-Euler timestep from (Y, t) to (Y_next, t+dt), solved
+# by damped Newton iteration (see the file-level comment above). Starts the
+# Newton iteration from an explicit-Euler predictor (`_euler_step`) rather
+# than `Y` itself, giving the iteration a head start toward the true
+# solution. `jacobian=:analytic` (default) uses the network's precomputed
+# analytic Jacobian (`_cached_network_jacobian!`) forming `I - dt*J`
+# directly; `:finite_difference` falls back to `_backward_euler_jacobian`.
+# Each iteration's correction is damped by `_positivity_limited_alpha` and
+# backtracked (halving `alpha` up to 12 times) until the residual norm
+# actually decreases, so a single bad Newton step can't blow up the
+# iteration. Throws `NewtonConvergenceError` if `max_newton_iterations` is
+# exhausted without meeting `newton_tolerance` (relative to `max(|Y_next|,
+# 1)`) -- the adaptive solver (`solve_network_adaptive`) catches this and
+# retries with a smaller `dt` rather than treating it as fatal.
 function _backward_euler_step(
     network::ReactionNetwork,
     Y::Vector{Float64},

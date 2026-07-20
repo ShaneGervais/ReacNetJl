@@ -83,8 +83,18 @@ end
 
 Q-value in MeV from a mass-excess table (a `Dict` of MeV values keyed by
 normalized species name, or a `PartitionFunctionTable`):
-`Q = sum(ME reactants) - sum(ME products)`. Returns `nothing` when any
-participant is missing from the table.
+
+```math
+Q = \\sum_{i \\in \\mathrm{reactants}} \\Delta_i - \\sum_{j \\in \\mathrm{products}} \\Delta_j
+```
+
+using each participant's atomic mass excess `\\Delta` (MeV). This is the
+standard mass-excess form of the Q-value (equivalent to, but more convenient
+than, working with absolute atomic masses directly, since mass excesses are
+`O(1-100)` MeV rather than `O(1000-100000)` MeV). Returns `nothing` when any
+participant is missing from the table, so callers (e.g.
+`read_tabulated_rates`, `generated_detailed_balance_reverse_table`) can fall
+back to a literature Q-value or skip the reverse-rate generation cleanly.
 """
 function reaction_q_value(mass_excess::AbstractDict, reactants, products)
     total = 0.0

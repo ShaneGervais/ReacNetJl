@@ -10,16 +10,28 @@ function _normalize_mass_fraction_keys(X::AbstractDict)
     return normalized
 end
 
-#=
+"""
     abundances_from_mass_fractions(network, X; normalize=false, check_sum=false, atol=1e-8)
 
-Convert a dictionary of mass fractions into an abundance vector ordered like
-`network.species`.
+Convert a dictionary of mass fractions `X_i` into an abundance vector `Y_i`
+ordered like `network.species`, using
 
-Missing network species are assigned zero mass fraction. Extra species not in the
-network raise an error. If `normalize=true`, mass fractions are divided by their
-total before conversion.
-=#
+```math
+Y_i = \\frac{X_i}{A_i}
+```
+
+per species (via `abundance_from_mass_fraction`). Abundance `Y_i` (mol g^-1)
+is the quantity the ODE solvers actually evolve, since it turns nuclear
+reaction counting into simple linear stoichiometry (`dY_i/dt` sums directly
+over reactions, whereas mass fractions would need extra `A_i` factors
+everywhere); mass fractions are recovered for reporting via
+`mass_fractions_from_abundances`.
+
+Missing network species are assigned zero mass fraction. Extra species not in
+the network raise an error. If `normalize=true`, mass fractions are divided by
+their total before conversion; if `check_sum=true` (and `normalize=false`), a
+total that deviates from 1 by more than `atol` raises an error instead.
+"""
 function abundances_from_mass_fractions(
     network::ReactionNetwork,
     X::AbstractDict;
@@ -51,12 +63,17 @@ function abundances_from_mass_fractions(
     return Y
 end
 
-#=
+"""
     mass_fractions_from_abundances(network, Y)
 
-Convert an abundance vector ordered like `network.species` into a dictionary of
-mass fractions keyed by normalized species name.
-=#
+Convert an abundance vector `Y_i` ordered like `network.species` into a
+dictionary of mass fractions keyed by normalized species name, using the
+inverse of `abundances_from_mass_fractions`:
+
+```math
+X_i = A_i Y_i
+```
+"""
 function mass_fractions_from_abundances(network::ReactionNetwork, Y::AbstractVector{<:Real})
     length(Y) == length(network.species) || throw(ArgumentError("Y length must match the number of network species"))
 
@@ -68,12 +85,14 @@ function mass_fractions_from_abundances(network::ReactionNetwork, Y::AbstractVec
     return X
 end
 
-#=
+"""
     mass_fraction_history(network, history)
 
-Convert an abundance-history matrix into a mass-fraction-history matrix with
-the same shape. Columns remain ordered like `network.species`.
-=#
+Convert an abundance-history matrix (`history[n, i] = Y_i(t_n)`, one row per
+saved solver time) into a mass-fraction-history matrix with the same shape,
+applying `X_i = A_i Y_i` row by row. Columns remain ordered like
+`network.species`.
+"""
 function mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix{<:Real})
     size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
 
@@ -88,6 +107,29 @@ function mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix
     return X_history
 end
 
+"""
+    first_mass_fraction_threshold_crossing(network, times, history, species, threshold; direction=:down)
+
+Find the first time a species' mass fraction `X(t)` crosses `threshold`,
+linearly interpolating between the two bracketing saved states rather than
+just returning the nearest grid point. For `direction=:down`, this locates
+where `X` first falls to or below `threshold` (e.g. the hydrogen-exhaustion
+time, `--stop-hydrogen` in the example driver); `direction=:up` finds the
+first rise to or above it instead.
+
+Between two adjacent saved states with mass fractions `x_0` at `t_0` and `x_1`
+at `t_1`, the crossing fraction along the segment is
+
+```math
+f = \\frac{\\mathrm{threshold} - x_0}{x_1 - x_0}, \\qquad t_{\\mathrm{cross}} = t_0 + f\\,(t_1 - t_0)
+```
+
+and the full abundance state is linearly interpolated the same way
+(`state = (1-f)\\,Y(t_0) + f\\,Y(t_1)`) so callers can resume/truncate a run
+from the crossing point. Returns `nothing` if the threshold is never crossed;
+returns immediately with `fraction=0.0` if the very first saved state already
+satisfies the crossing condition.
+"""
 function first_mass_fraction_threshold_crossing(
     network::ReactionNetwork,
     times::AbstractVector{<:Real},
@@ -140,11 +182,20 @@ function first_mass_fraction_threshold_crossing(
     return nothing
 end
 
-#=
+"""
     total_mass_fraction(network, Y)
 
-Return `sum_i A_i Y_i` for one abundance state.
-=#
+Return the total mass fraction of the active network,
+
+```math
+\\sum_i X_i = \\sum_i A_i Y_i
+```
+
+for one abundance state. Should stay at (or very near) 1 throughout a run
+since baryon number is conserved by every reaction (`network_validation_report`
+checks this per-reaction); systematic drift here signals a solver-accuracy or
+bookkeeping problem, not real physics.
+"""
 function total_mass_fraction(network::ReactionNetwork, Y::AbstractVector{<:Real})
     length(Y) == length(network.species) || throw(ArgumentError("Y length must match the number of network species"))
 
@@ -156,11 +207,12 @@ function total_mass_fraction(network::ReactionNetwork, Y::AbstractVector{<:Real}
     return total
 end
 
-#=
+"""
     total_mass_fraction_history(network, history)
 
-Return the total mass fraction at every saved abundance-history row.
-=#
+Return `total_mass_fraction(network, Y(t_n))` at every saved abundance-history
+row -- the raw data behind `mass_fraction_drift`'s conservation summary.
+"""
 function total_mass_fraction_history(network::ReactionNetwork, history::AbstractMatrix{<:Real})
     size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
 
@@ -171,11 +223,16 @@ function total_mass_fraction_history(network::ReactionNetwork, history::Abstract
     return totals
 end
 
-#=
+"""
     mass_fraction_drift(network, history)
 
-Summarize total-mass-fraction drift over a history.
-=#
+Summarize total-mass-fraction (`\\sum_i X_i`, see `total_mass_fraction`) drift
+over a history: the initial and final totals, net `drift = final - initial`,
+the largest absolute deviation from the initial total at any saved time
+(`max_abs_drift`), and the min/max totals reached. This is the network's
+baryon-conservation health check -- a well-behaved solve should show `drift`
+and `max_abs_drift` many orders of magnitude below 1.
+"""
 function mass_fraction_drift(network::ReactionNetwork, history::AbstractMatrix{<:Real})
     totals = total_mass_fraction_history(network, history)
     initial = first(totals)
@@ -209,12 +266,18 @@ function _matrix_minimum_location(values::AbstractMatrix{<:Real})
     return min_value, min_row, min_col
 end
 
-#=
+"""
     abundance_diagnostics(network, history)
 
-Report positivity-oriented diagnostics for an abundance history, including the
-minimum abundance and minimum mass fraction with species/time indices.
-=#
+Report positivity-oriented diagnostics for an abundance history: the minimum
+abundance `Y_i` and minimum mass fraction `X_i` reached anywhere in the run,
+each with the species and time-index where it occurred, plus boolean flags
+for whether either dipped negative. Explicit and adaptive backward-Euler
+solving can produce small negative abundances near a true zero from
+finite-precision Newton iteration; `has_negative_abundance` /
+`has_negative_mass_fraction` distinguish "solver noise at the floor" from a
+real instability without requiring a full history scan by hand.
+"""
 function abundance_diagnostics(network::ReactionNetwork, history::AbstractMatrix{<:Real})
     size(history, 2) == length(network.species) || throw(ArgumentError("history column count must match the number of network species"))
 

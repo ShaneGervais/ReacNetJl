@@ -1,6 +1,14 @@
 # Adaptive step-size controller.
 
 
+# Largest per-species relative abundance change over one proposed step,
+#
+#   max_i |Y_next[i] - Y[i]| / max(|Y[i]|, abundance_floor)
+#
+# the primary step-acceptance criterion in `solve_network_adaptive`.
+# `abundance_floor` avoids division by (near-)zero for trace species whose
+# abundance is numerically negligible but can still change by a large
+# relative amount without that being physically meaningful.
 function _max_fractional_change(Y::Vector{Float64}, Y_next::Vector{Float64}, abundance_floor::Float64)
     max_change = 0.0
     for i in eachindex(Y)
@@ -10,6 +18,11 @@ function _max_fractional_change(Y::Vector{Float64}, Y_next::Vector{Float64}, abu
     return max_change
 end
 
+# Largest per-species absolute abundance change over one proposed step,
+# `max_i |Y_next[i] - Y[i]|`. The secondary (optional, via
+# `max_absolute_change`) step-acceptance criterion -- catches large absolute
+# swings that the *fractional* criterion alone might miss for a species
+# whose abundance floor makes a huge absolute change look fractionally small.
 function _max_absolute_change(Y::Vector{Float64}, Y_next::Vector{Float64})
     max_change = 0.0
     for i in eachindex(Y)
@@ -18,6 +31,16 @@ function _max_absolute_change(Y::Vector{Float64}, Y_next::Vector{Float64})
     return max_change
 end
 
+# Proposed step-size scale factor for the *next* step, from a standard
+# step-doubling/halving controller: shrink dt in proportion to how far the
+# observed change exceeded its limit (with a safety margin < 1 so the next
+# attempt is more likely to succeed), or grow it up to `growth_factor` when
+# the step was comfortably within limits:
+#
+#   factor = clamp(min(growth_factor,
+#                       safety * max_fractional_change / fractional_change,
+#                       safety * max_absolute_change / absolute_change),
+#                  shrink_factor, growth_factor)
 function _adaptive_factor(
     fractional_change::Float64,
     max_fractional_change::Float64,
@@ -37,18 +60,37 @@ function _adaptive_factor(
     return clamp(factor, shrink_factor, growth_factor)
 end
 
-#=
+"""
     solve_network_adaptive(network, Y0, tspan, dt_initial, rho, T9; ...)
 
-Evolve a network with simple adaptive explicit timestepping. A proposed step is
-accepted when the maximum fractional abundance change is below
-`max_fractional_change`, using `abundance_floor` to avoid division by zero for
-trace species. If `max_absolute_change` is finite, the step must also satisfy
-that absolute abundance-change limit.
+Evolve a network with adaptive timestepping, wrapping any of the
+`solve_network` methods (`:euler`, `:rk4`, or the default `:backward_euler`)
+with step-size control. This is the driver `run_ppn` actually uses.
 
-This is still an explicit method, not a stiff implicit solver, but it is safer
-than a fixed timestep for exploratory post-processing.
-=#
+A proposed step is accepted when the maximum fractional abundance change
+(`_max_fractional_change`) is below `max_fractional_change`, using
+`abundance_floor` to avoid division by (near-)zero for trace species. If
+`max_absolute_change` is finite, the step must also satisfy that absolute
+abundance-change limit (`_max_absolute_change`). After acceptance, the next
+step's `dt` is scaled by `_adaptive_factor` (shrink toward `shrink_factor`,
+grow toward `growth_factor`, both relative to how close the observed change
+came to its limit); a rejected step retries at `dt * shrink_factor`.
+
+With `method=:backward_euler`, a Newton-iteration failure
+(`NewtonConvergenceError`, see backward_euler.jl) is treated the same way as
+an over-large abundance change: the step is rejected and retried at a smaller
+`dt`, rather than propagating as a fatal error -- this is what lets nova
+networks with very stiff fast/slow rate ratios integrate through difficult
+transients (e.g. peak temperature) without manual step-size tuning. Both
+`dt_min` and `max_steps` are hard limits: hitting `dt_min` while still
+violating the change limits, or exceeding `max_steps` accepted steps, raises
+an error rather than silently producing a poor-quality solution.
+
+Returns `(times, history)`, or `(times, history, solver_stats)` if
+`return_stats=true` -- `solver_stats` includes accepted/rejected step counts,
+the `dt` range actually used, whether `dt_min` was ever reached, and (for
+`:backward_euler`) Newton-iteration statistics.
+"""
 function solve_network_adaptive(
     network::ReactionNetwork,
     Y0::AbstractVector{<:Real},

@@ -144,18 +144,10 @@ function species_from_name(name::AbstractString)
     return Species(normalized, _ELEMENT_Z[symbol], A)
 end
 
-#=
-    parse_reaction_label(label)
-
-Parse a reaction label of the form `target(projectile,ejectile)product`.
-Returns `(reactants, products)`, where both entries are normalized species-name
-vectors.
-
-Examples:
-- `parse_reaction_label("18F(p,α)15O") == (["p", "f18"], ["he4", "o15"])`
-- `parse_reaction_label("18F(p,γ)19Ne") == (["p", "f18"], ["ne19"])`
-- `parse_reaction_label("p(p,eν)d") == (["p", "p"], ["d"])`
-=#
+# Recognize the ejectile slot of a decay-style label, e.g. "18F(β+)18O": the
+# token inside the parentheses names the decay mode, not a real projectile
+# particle, so parse_reaction_label must special-case it before falling
+# through to the general target(projectile,ejectile)product grammar.
 function _is_beta_token(token::AbstractString)
     s = lowercase(strip(token))
     s = replace(s, " " => "", "β" => "beta")
@@ -194,6 +186,32 @@ function _parse_reaction_token(token::AbstractString; allow_multiplicity::Bool=f
     return [normalized]
 end
 
+"""
+    parse_reaction_label(label)
+
+Parse a reaction label of the form `target(projectile,ejectile)product` (the
+usual nuclear-astrophysics shorthand, e.g. `"18F(p,α)15O"`), or a decay-style
+label `parent(β+)daughter` / `parent(β-)daughter`. Returns `(reactants,
+products)`, where both entries are normalized species-name vectors (see
+`normalize_species_name`).
+
+This is the inverse-ish counterpart to `reaction_string`. It accepts several
+notational variants for convenience:
+- Greek or ASCII particle symbols (`α`/`a`/`alpha`, `γ`/`g`/`gamma`).
+- Neutrino-emitting weak captures like `"p(p,eν)d"` (the `eν` ejectile
+  token is dropped -- it carries no baryon number to place in `products`).
+- Multiplicity-prefixed ejectiles like `"2n"` or `"3α"` via
+  `_parse_particle_multiplicity`, expanding to repeated entries in the
+  returned vector (matching how `_symmetry_factor` expects repeated
+  reactants/products to be represented).
+- `26Alg`/`26Alm` ground-state/isomer notation for the `Species`
+  book-keeping.
+
+Examples:
+- `parse_reaction_label("18F(p,α)15O") == (["p", "f18"], ["he4", "o15"])`
+- `parse_reaction_label("18F(p,γ)19Ne") == (["p", "f18"], ["ne19"])`
+- `parse_reaction_label("p(p,eν)d") == (["p", "p"], ["d"])`
+"""
 function parse_reaction_label(label::AbstractString)
     decay_match = match(r"^\s*([^\(]+)\(([^,\)]+)\)(.+?)\s*$", label)
     if decay_match !== nothing && _is_beta_token(decay_match.captures[2])
@@ -215,17 +233,21 @@ function parse_reaction_label(label::AbstractString)
     return reactants, products
 end
 
-#=
+"""
     abundance_from_mass_fraction(X, A)
 
-Convert mass fraction `Xᵢ` to abundance `Yᵢ = Xᵢ / Aᵢ`.
-=#
+Convert mass fraction `Xᵢ` to abundance `Yᵢ = Xᵢ / Aᵢ` (mol g^-1) for one
+species of mass number `A`. The atomic building block of
+`abundances_from_mass_fractions`.
+"""
 abundance_from_mass_fraction(X::Real, A::Integer) = X / A
 
-#=
+"""
     mass_fraction_from_abundance(Y, A)
 
-Convert abundance `Yᵢ` to mass fraction `Xᵢ = Aᵢ Yᵢ`.
-=#
+Convert abundance `Yᵢ` to mass fraction `Xᵢ = Aᵢ Yᵢ` for one species of mass
+number `A` -- the inverse of `abundance_from_mass_fraction`, and the atomic
+building block of `mass_fractions_from_abundances`.
+"""
 mass_fraction_from_abundance(Y::Real, A::Integer) = A * Y
 

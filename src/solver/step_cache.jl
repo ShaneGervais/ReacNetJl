@@ -69,6 +69,12 @@ function _build_step_cache(
     return NetworkStepCache(rho_value, T9_value, prefactors, mode, screening_scale)
 end
 
+# Composition-dependent part of the weak-screening exponent that's shared by
+# every reaction in one evaluation: `0.188*sqrt(rho*zeta/T6^3)` from
+# `weak_screening_multiplier`, split into its rho/T9-only prefactor
+# (`cache.screening_scale`, precomputed once per step) times sqrt(zeta)
+# (composition-dependent, recomputed per Y). `_cached_screening_multiplier`
+# then only needs `charge_pair_sum * zeta_scale` per reaction.
 function _screening_zeta_scale(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{Float64})
     cache.screening == :weak || return 0.0
     zeta = _screening_composition_factor(network, Y)
@@ -178,15 +184,26 @@ function _cached_network_jacobian!(J::Matrix{Float64}, network::ReactionNetwork,
 end
 
 
+# Evaluate a trajectory quantity at time t, whether it's a constant Real
+# (single-zone experiments with fixed rho/T9) or a callable profile (e.g.
+# from `trajectory_profiles`). This dispatch is what lets every solver
+# accept `rho`/`T9` as either form without duplicating each stepper.
 _profile_value(value::Real, t::Real) = Float64(value)
 _profile_value(value, t::Real) = Float64(value(t))
 
+# Uncached RHS evaluation at time t: resolve rho(t)/T9(t), then call
+# `network_rhs`. Used when no step cache applies (a custom screening
+# function, see `_build_step_cache`).
 function _rhs_at(network::ReactionNetwork, Y::AbstractVector{<:Real}, rho, T9, t::Real; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     rho_t = _profile_value(rho, t)
     T9_t = _profile_value(T9, t)
     return network_rhs(Y, network, rho_t, T9_t; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
 end
 
+# Resolve rho(t)/T9(t) and build the `NetworkStepCache` for that instant, or
+# `nothing` if this screening choice can't be cached (a custom function) --
+# the entry point every stepper (`_euler_step`, `_rk4_step`,
+# `_backward_euler_step`) uses at the start of a timestep.
 function _step_cache_at(network::ReactionNetwork, rho, T9, t::Float64; rate_multipliers=nothing, rate_p_values=nothing, screening=nothing)
     return _build_step_cache(
         network,

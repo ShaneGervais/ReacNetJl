@@ -1,5 +1,8 @@
 # Conservation checks and network validation reports.
 
+# Sum mass number A or charge Z (property=:A or :Z) over a list of species
+# names, e.g. sum_i A_i over a reaction's reactants -- the building block of
+# the baryon/charge conservation check in `reaction_conservation`.
 function _species_property_sum(names::AbstractVector{String}, property::Symbol)
     total = 0
     for name in names

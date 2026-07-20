@@ -43,10 +43,20 @@ function find_reverse_rate(tables::AbstractVector{ReactionRateTable}, label::Abs
     return filter(t -> lowercase(t.source) == wanted, matches)
 end
 
+# Hashable key identifying a reaction by its reactant/product species alone
+# (ignoring rate source, Q-value, etc.) -- used throughout to detect "is this
+# the same reaction" when merging/de-duplicating tables from different
+# libraries (`_unique_reaction_tables`, `add_reverse_reaction_tables`,
+# `iliadis2002_rate_tables`'s paper-table override matching).
 function _reaction_participant_key(table::ReactionRateTable)
     return (Tuple(table.reactants), Tuple(table.products))
 end
 
+# Keep only the first table for each distinct reaction (by
+# `_reaction_participant_key`), preserving input order. Used when building a
+# network from a table list that may contain more than one source/label for
+# the same reaction; `network_from_tables` wants exactly one rate per
+# reaction, so this is the arbitrary-but-deterministic tie-break.
 function _unique_reaction_tables(tables::AbstractVector{ReactionRateTable})
     seen = Set{Any}()
     selected = ReactionRateTable[]
@@ -59,6 +69,11 @@ function _unique_reaction_tables(tables::AbstractVector{ReactionRateTable})
     return selected
 end
 
+# Index every table by its `_reaction_participant_key`, for O(1) reverse-rate
+# lookup in `add_reverse_reaction_tables` (is there an explicit table whose
+# reactants/products are this forward reaction's products/reactants,
+# reversed?). Tables that fail baryon/charge bookkeeping are excluded so a
+# malformed row can't be mistaken for a real reverse rate.
 function _reverse_table_lookup(tables::AbstractVector{ReactionRateTable})
     lookup = Dict{Any,ReactionRateTable}()
     for table in tables
@@ -68,14 +83,17 @@ function _reverse_table_lookup(tables::AbstractVector{ReactionRateTable})
     end
     return lookup
 end
-#=
-    interpolate_rate(table, T9)
 
-Linearly interpolate a reaction rate at temperature `T9` in GK.
-
-Interpolation is linear in `log(rate)` versus `log(T9)`, which is usually more
-reasonable for tabulated thermonuclear rates than linear-linear interpolation.
-=#
+# Shared log-log interpolation for both `interpolate_rate` and
+# `interpolate_factor_uncertainty`: linear in log(value) versus log(T9)
+# ( ln y = (1-w) ln y0 + w ln y1, with w = (ln T9 - ln T0)/(ln T1 - ln T0) ),
+# the standard choice for thermonuclear rates since both T9 grids and rate
+# magnitudes span many orders of magnitude (a linear-linear interpolant would
+# badly misrepresent the curvature between grid points). Values are floored
+# at `LOG_INTERPOLATION_FLOOR` before taking the log so a tabulated zero
+# (astrophysically negligible, but not loggable) doesn't error. Throws if
+# `T9` falls outside the table's grid -- this is intentional: extrapolating a
+# tabulated rate silently would be worse than failing loudly.
 function _interpolate_loglog(grid::AbstractVector{<:Real}, values::AbstractVector{<:Real}, T9::Real; value_name::AbstractString="value")
     length(grid) == length(values) || throw(ArgumentError("grid and $value_name arrays must have the same length"))
     T = Float64(T9)
@@ -95,6 +113,22 @@ function _interpolate_loglog(grid::AbstractVector{<:Real}, values::AbstractVecto
     return exp((1 - weight) * y0 + weight * y1)
 end
 
+"""
+    interpolate_rate(table, T9)
+
+Interpolate a reaction rate at temperature `T9` (GK), linearly in
+`log(rate)` versus `log(T9)`:
+
+```math
+\\ln R(T_9) = (1-w)\\ln R_0 + w\\ln R_1, \\qquad w = \\frac{\\ln T_9 - \\ln T_{9,0}}{\\ln T_{9,1} - \\ln T_{9,0}}
+```
+
+between the two grid points `T_{9,0} \\le T_9 \\le T_{9,1}` bracketing the
+query. This is usually more physically reasonable than linear-linear
+interpolation, since thermonuclear rates and the STARLIB/REACLIB temperature
+grid both vary over many orders of magnitude. Throws if `T9` is outside the
+table's tabulated range.
+"""
 function interpolate_rate(table::ReactionRateTable, T9::Real)
     return _interpolate_loglog(table.T9, table.rate, T9; value_name="rate")
 end

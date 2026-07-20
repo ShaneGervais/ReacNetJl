@@ -1,5 +1,9 @@
 # Weak (Salpeter) and Chugunov (2007) electron screening.
 
+# zeta = sum_i (Z_i^2 + Z_i) Y_i over charged species, the composition
+# factor in the Salpeter weak-screening exponent (see
+# `weak_screening_multiplier`). Negative abundances (solver floor noise) are
+# clamped to zero rather than allowed to reduce zeta.
 function _screening_composition_factor(network::ReactionNetwork, Y::AbstractVector{<:Real})
     factor = 0.0
     for (i, species) in pairs(network.species_info)
@@ -12,9 +16,28 @@ end
 """
     weak_screening_multiplier(network, reaction, Y, rho, T9)
 
-Return an approximate weak-screening multiplier for charged-particle reactions.
-This is a Salpeter-style diagnostic multiplier using the current abundance
-composition. Reactions with fewer than two charged reactants return `1.0`.
+Return an approximate weak (Salpeter-style) electron-screening multiplier for
+a charged-particle reaction, valid only in the weak-screening limit
+(`screening=:chugunov` extends into the strong regime; see
+`chugunov_screening_multiplier`). Reactions with fewer than two charged
+reactants return `1.0` (screening only matters when reactants must overcome
+each other's Coulomb barrier).
+
+For each charged reactant pair `(i,j)` in the reaction, the screening
+enhancement of the rate is `f_{\\mathrm{scr}} = e^{h_{ij}}` with
+
+```math
+h_{ij} = 0.188\\, Z_i Z_j \\sqrt{\\frac{\\rho\\,\\zeta}{T_6^3}}, \\qquad
+\\zeta = \\sum_k \\left(Z_k^2 + Z_k\\right) Y_k
+```
+
+where `T_6 = 10^6\\,T_9\\,\\mathrm{K}` is temperature in millions of kelvin and
+`\\zeta` (from `_screening_composition_factor`) captures the current ionized
+composition. The exponent is summed over every charged reactant pair (more
+than two reactants, e.g. triple-alpha, contribute one term per pair) and
+clamped at `max_exponent` to avoid overflow at very high density/low
+temperature, where this weak-screening approximation is no longer physically
+valid anyway.
 """
 function weak_screening_multiplier(
     network::ReactionNetwork,
@@ -133,8 +156,28 @@ end
 """
     chugunov_screening_multiplier(network, reaction, Y, rho, T9)
 
-Chugunov, DeWitt & Yakovlev (2007) screening multiplier for one reaction at
-the current composition. Available network-wide with `screening=:chugunov`.
+Chugunov, DeWitt & Yakovlev (2007) screening multiplier `e^h` for one
+reaction at the current composition, valid from the weak- into the
+strong-screening regime (unlike `weak_screening_multiplier`, which is
+Salpeter-only). Available network-wide with `screening=:chugunov`.
+
+The screening exponent `h` for one ion pair with charges/masses `(Z_1,A_1)`,
+`(Z_2,A_2)` depends on the plasma coupling parameter
+
+```math
+\\Gamma = \\frac{Z_1 Z_2\\, e^2}{\\tilde{Z}\\, k_B T\\, a_e}
+```
+
+(`a_e` the electron-sphere radius set by the free-electron density `n_e`, and
+`\\tilde{Z} = (Z_1^{1/3}+Z_2^{1/3})/2`) through the fitted polynomial form of
+`_chugunov_pair_exponent`, which reduces to the Salpeter/Debye-Hückel result
+for `\\Gamma \\ll 1` and to the strongly-coupled-plasma (OCP) result for
+`\\Gamma \\gg 1`; `_smooth_clip` blends the fit smoothly at its `\\Gamma \\sim 600`,
+`T \\sim 0.1\\,T_p` validity boundary rather than truncating sharply. For
+reactions with more than two reactants (e.g. triple-alpha), the exponent is
+the sum over sequential compound pairs: first `he4+he4`, then the accumulated
+`(Z,A)` of that pair screened again against the third `he4`, matching how the
+reaction actually proceeds as two sequential two-body collisions.
 """
 function chugunov_screening_multiplier(
     network::ReactionNetwork,
@@ -174,6 +217,11 @@ function chugunov_screening_multiplier(
     return exp(min(exponent, _SCREENING_MAX_EXPONENT))
 end
 
+# Dispatch the user-facing `screening=` keyword (accepted throughout the
+# solver/flux API) to the concrete multiplier function, or `1.0` (no
+# screening) when `screening` is `nothing`/`false`. Allows a custom
+# `(network, reaction, Y, rho, T9) -> multiplier` function too, e.g. for
+# testing a screening prescription that isn't built in.
 function _screening_multiplier(screening, network::ReactionNetwork, reaction::Reaction, Y::AbstractVector{<:Real}, rho::Real, T9::Real)
     if screening === nothing || screening === false
         return 1.0

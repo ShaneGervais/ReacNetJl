@@ -85,6 +85,13 @@ function _factorial(n::Int)
     return value
 end
 
+# Symmetry factor prod_j (nu^react_j)! from the flux equation in
+# `reaction_flux`: for `k` copies of an identical reactant species (e.g.
+# `p+p`, `he4+he4+he4` for triple-alpha), the same physical collision is
+# counted `k!` times by the naive `prod Y_j^nu_j` product, so dividing by
+# `k!` per distinct reactant species recovers the correct flux. Reactions
+# with all-distinct reactants have every count equal to 1 and this factor is
+# 1, matching ordinary two-body reactions with no correction needed.
 function _symmetry_factor(species::Vector{String})
     factor = 1
     for i in eachindex(species)
@@ -120,6 +127,17 @@ function _index_counts(indices::Vector{Int})
     return unique_indices, counts
 end
 
+# Precompute per-reaction bookkeeping once at network-construction time so the
+# solver's per-timestep RHS/Jacobian evaluation only does array lookups, not
+# repeated species-name parsing or charge/mass arithmetic:
+#   - stoichiometric_delta: the dY_i/dt coefficient (nu^prod_i - nu^react_i)
+#     for every species i, precomputed as a dense vector (see network_rhs).
+#   - charge_pair_sum: sum_{i<j} Z_i Z_j over charged reactant pairs, the
+#     Coulomb-barrier input to `weak_screening_multiplier`.
+#   - screening_pairs: sequential (Z1,A1,Z2,A2) pairs for Chugunov-style
+#     screening of reactions with more than two reactants -- e.g. triple-alpha
+#     is screened as he4+he4 forming an effective 8Be-like pair, then that
+#     compound charge/mass screened again against the third he4.
 function _compile_reaction(reaction::Reaction, species_index::AbstractDict, nspecies::Int)
     reactant_indices = [_species_index(species_index, name) for name in reaction.reactants]
     product_indices = [_species_index(species_index, name) for name in reaction.products]
@@ -228,18 +246,35 @@ function _infer_species_from_reactions(reactions::AbstractVector{Reaction})
     return species
 end
 
+"""
+    network_from_tables(tables; species=nothing)
+
+Build a `ReactionNetwork` directly from a vector of `ReactionRateTable`s (one
+reaction per table, after de-duplicating identical reactant/product/chapter
+entries via `_unique_reaction_tables`). This is the path used by `run_ppn` and
+the nova-network selectors (`select_h_ca_reaction_tables`,
+`add_reverse_reaction_tables`), which already produce a specific table list to
+turn into a network. If `species` is not supplied, the species list is
+inferred from the union of every reaction's reactants and products.
+"""
 function network_from_tables(tables::AbstractVector{ReactionRateTable}; species=nothing)
     reactions = [Reaction(table) for table in _unique_reaction_tables(tables)]
     network_species = species === nothing ? _infer_species_from_reactions(reactions) : collect(species)
     return ReactionNetwork(network_species, reactions)
 end
 
-#=
+"""
     network_from_labels(tables, labels; species=nothing, source=nothing, on_multiple=:error)
 
-Build a `ReactionNetwork` directly from STARLIB reaction labels. If `species` is
-not supplied, the network species list is inferred from the selected reactions.
-=#
+Build a `ReactionNetwork` directly from human-readable reaction labels (e.g.
+`"18F(p,α)15O"`), looking each one up in `tables` via `reaction_from_label`.
+This is the label-driven, interactive-experimentation path (used by
+`solve_single_zone`); `network_from_tables` is the corresponding path for
+programmatically-selected table lists. If `species` is not supplied, the
+network species list is inferred from the selected reactions. If a label
+matches more than one rate table (e.g. both a STARLIB and a REACLIB entry),
+pass `source` to disambiguate or `on_multiple=:first` to take the first match.
+"""
 function network_from_labels(
     tables::AbstractVector{ReactionRateTable},
     labels::AbstractVector{<:AbstractString};

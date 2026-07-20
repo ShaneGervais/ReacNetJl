@@ -99,6 +99,24 @@ function starlib_chapter_report(tables::AbstractVector{ReactionRateTable})
 end
 
 
+"""
+    read_starlib(path=DEFAULT_STARLIB_PATH; warn_unsupported=false)
+
+Read a STARLIB v6-format rate library into `ReactionRateTable` entries.
+
+STARLIB stores each reaction as a fixed-size block: one header line
+(`chapter reactant/product-symbols... source q_value`) followed by exactly
+`STARLIB_ROWS_PER_REACTION` data rows of `T9 rate factor_uncertainty`
+(`rate` is the STARLIB-recommended central value at that grid point;
+`factor_uncertainty` is its multiplicative lognormal factor uncertainty, the
+basis for Monte Carlo sampling via `sampled_interpolate_rate`). The chapter
+number encodes the reactant/product counts (`_split_starlib_species`); rows
+whose chapter/species-count combination isn't one of the ones
+`_supported_starlib_layout` recognizes are still kept (as raw reactants with
+empty products) rather than dropped, so `starlib_chapter_report` can later
+show exactly what coverage gap exists instead of silently losing data. Pass
+`warn_unsupported=true` to also emit an `@warn` summary immediately.
+"""
 function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsupported::Bool=false)
     tables = ReactionRateTable[]
     unsupported_counts = Dict{Int,Int}()

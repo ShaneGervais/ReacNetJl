@@ -1,6 +1,9 @@
 # Fixed-step time integration driver.
 
 
+# Summarize backward-Euler Newton-iteration counts across a run (mean/max
+# iterations per step, and how many steps failed to converge) for the
+# `solver_stats` diagnostic returned alongside the abundance history.
 function _newton_iteration_summary(iterations::Vector{Int}, failed_steps::Integer)
     if isempty(iterations)
         return (
@@ -19,6 +22,10 @@ function _newton_iteration_summary(iterations::Vector{Int}, failed_steps::Intege
     )
 end
 
+# Assemble the `solver_stats` named tuple for a fixed-step run. Since every
+# step uses the same `dt` by construction, `rejected_steps`/
+# `max_fractional_change`/`reached_dt_min` are trivial placeholders that
+# only carry real information for the adaptive solver (see adaptive.jl).
 function _fixed_solver_stats(times::AbstractVector{<:Real}, newton_iterations::Vector{Int}, newton_failed_steps::Integer)
     step_sizes = diff(Float64.(times))
     return (
@@ -40,6 +47,11 @@ function _validate_time_inputs(t_start::Float64, t_end::Float64, dt::Float64)
     dt > 0 || throw(ArgumentError("dt must be positive"))
 end
 
+# Build the fixed-step time grid from t_start to t_end in steps of dt. The
+# final grid point is snapped exactly to t_end (extending with a final short
+# step if dt doesn't evenly divide the interval, or trimming an overshoot
+# back to t_end) so the run always finishes exactly at the requested time
+# rather than overshooting or falling short by a fractional step.
 function _time_grid(tspan::Tuple{<:Real,<:Real}, dt::Real)
     t_start = Float64(tspan[1])
     t_end = Float64(tspan[2])
@@ -60,30 +72,37 @@ function _checked_initial_abundances(Y0::AbstractVector{<:Real}, network::Reacti
     length(Y0) == length(network.species) || throw(ArgumentError("Y0 length must match the number of network species"))
     return Float64.(Y0)
 end
-#=
+"""
     solve_network(network, Y0, tspan, dt, rho, T9; method=:rk4, rate_multipliers=nothing, clamp_negative=true)
 
-Evolve a single-zone reaction network in time.
+Evolve a single-zone reaction network in time with a *fixed* timestep `dt`
+(see `solve_network_adaptive` for automatic step-size control, the choice
+`run_ppn` actually uses).
 
-This solves the ordinary differential equation system `dY/dt = f(Y, rho, T9)`.
-For a single-zone post-processing network there are no spatial derivatives, so
-this is an ODE system rather than a PDE.
+This solves the ordinary differential equation system `dY/dt = f(Y, rho, T9)`
+(`f` = `network_rhs`). For a single-zone post-processing network there are no
+spatial derivatives, so this is an ODE system rather than a PDE.
 
 Arguments:
 - `network`: a `ReactionNetwork`.
 - `Y0`: initial abundance vector ordered like `network.species`.
 - `tspan`: `(t_start, t_end)` in seconds.
 - `dt`: fixed timestep in seconds.
-- `rho`: density in g cm^-3, or a function `rho(t)`.
+- `rho`: density in g cm^-3, or a function `rho(t)` (e.g. from `trajectory_profiles`).
 - `T9`: temperature in GK, or a function `T9(t)`.
 
-Supported methods are `:euler`, `:rk4`, and `:backward_euler`. RK4 is usually
-more accurate for the same timestep, while backward Euler is a dependency-free
-implicit option for stiffer exploratory runs.
+Supported methods are `:euler`, `:rk4`, and `:backward_euler` (see
+explicit.jl/backward_euler.jl for each method's update formula). RK4 is
+usually more accurate for the same timestep among the explicit choices, while
+backward Euler is the implicit, unconditionally-stable option needed for
+stiff nova networks. With `clamp_negative=true` (default), any abundance that
+goes slightly negative after a step is clamped to zero.
 
-Returns `(times, Y_history)`, where `Y_history[i, j]` is the abundance of species
-`network.species[j]` at `times[i]`.
-=#
+Returns `(times, Y_history)`, where `Y_history[i, j]` is the abundance of
+species `network.species[j]` at `times[i]`; pass `return_stats=true` to also
+get a `solver_stats` named tuple (Newton-iteration counts, if
+`method=:backward_euler`).
+"""
 function solve_network(
     network::ReactionNetwork,
     Y0::AbstractVector{<:Real},
@@ -151,6 +170,10 @@ function solve_network(
     return return_stats ? (times, Y_history, stats) : (times, Y_history)
 end
 
+# Dispatch one timestep to the requested method's stepper; shared by
+# `solve_network`'s fixed-step loop and `solve_network_adaptive`'s
+# accept/reject loop (adaptive.jl), so both drivers stay in sync about which
+# methods exist and how each is invoked.
 function _single_step(
     network::ReactionNetwork,
     Y::Vector{Float64},

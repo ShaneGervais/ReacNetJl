@@ -3,14 +3,27 @@
 """
     reaction_flux(reaction, Y, species_index, rho, T9; rate_multiplier=1.0)
 
-Calculate the abundance flux for one reaction.
+Calculate the abundance flux `F_r` for one reaction `r`, in mol g^-1 s^-1.
 
-`Y` is the abundance vector. `species_index` maps species names to positions in
-`Y`. `rho` is mass density in g cm^-3, and `T9` is temperature in GK.
+`Y` is the abundance vector (mol g^-1). `species_index` maps species names to
+positions in `Y`. `rho` is mass density in g cm^-3, and `T9` is temperature in
+GK. `rate_multiplier` scales the interpolated rate (used for STARLIB
+factor-uncertainty sampling and Monte Carlo studies); `rate_p_value`, if given,
+samples the rate at a fixed lognormal quantile via `sampled_interpolate_rate`
+instead of using the tabulated central value.
 
-For a one-body reaction, the flux is `rate * Yᵢ`. For a two-body reaction using
-STARLIB's usual `N_A <σv>` rate, the flux is `rho * rate * Yᵢ * Yⱼ`, with the
-standard symmetry correction for identical reactants.
+For a reaction with `N_r` reactants (counting repeats) and rate `R_r(T_9)`:
+
+```math
+F_r = \\frac{\\rho^{N_r-1} R_r(T_9) \\prod_j Y_j^{\\nu^{\\mathrm{react}}_{j,r}}}{\\prod_j \\nu^{\\mathrm{react}}_{j,r}!}
+```
+
+where `\\nu^{\\mathrm{react}}_{j,r}` is the number of times species `j` appears
+as a reactant. This reduces to `F_r = R_r Y_i` for a one-body decay/disintegration
+(`N_r = 1`, no density factor), `F_r = \\rho R_r Y_i Y_j` for a two-body capture
+of distinct species, and includes the `1/2!` symmetry factor from
+`_symmetry_factor` for reactions with two identical reactants (e.g. `p+p`,
+`α+α`) so the same physical collision isn't double-counted.
 """
 function reaction_flux(
     reaction::Reaction,
@@ -59,15 +72,29 @@ function _reaction_flux(
     return density_factor * rate * abundance_product / compiled.symmetry_factor
 end
 
-#=
+"""
     network_rhs(Y, reactions, species_index, rho, T9; rate_multipliers=nothing)
 
 Calculate `dY/dt` for a single-zone reaction network at fixed density and
-temperature.
+temperature (the label-driven form; see the `ReactionNetwork` method below for
+the precompiled, performance-path form used by the solvers).
 
-`rate_multipliers` can be supplied as a vector the same length as `reactions`.
-This gives us a simple hook for later STARLIB uncertainty studies.
-=#
+For each reaction `r` with flux `F_r` (see `reaction_flux`), every reactant
+loses `F_r` and every product gains `F_r`, so for species `i`:
+
+```math
+\\frac{dY_i}{dt} = \\sum_r \\left(\\nu^{\\mathrm{prod}}_{i,r} - \\nu^{\\mathrm{react}}_{i,r}\\right) F_r
+```
+
+where `\\nu^{\\mathrm{prod}}_{i,r}` and `\\nu^{\\mathrm{react}}_{i,r}` count how
+many times species `i` appears as a product or reactant of reaction `r`
+(usually 0 or 1, but 2 for e.g. `p+p -> d + 2p`-style multiproduct channels).
+
+`rate_multipliers` can be supplied as a vector the same length as `reactions`,
+one scalar multiplier per reaction. This is the hook used for STARLIB
+factor-uncertainty sampling and Monte Carlo uncertainty studies (`rate_p_values`
+does the same for lognormal-quantile sampling).
+"""
 function network_rhs(
     Y::AbstractVector{<:Real},
     reactions::AbstractVector{Reaction},
@@ -139,12 +166,14 @@ function network_rhs(
     return dYdt
 end
 
-#=
+"""
     reaction_fluxes(network, Y, rho, T9; rate_multipliers=nothing)
 
-Calculate instantaneous reaction fluxes for every reaction in a network.
-The returned vector is ordered like `network.reactions`.
-=#
+Calculate the instantaneous flux `F_r` (see `reaction_flux`) of every reaction
+in a precompiled `network`, using the network's `CompiledReaction` bookkeeping
+(reactant/product indices, symmetry factors) for speed. The returned vector is
+ordered like `network.reactions`.
+"""
 function reaction_fluxes(
     network::ReactionNetwork,
     Y::AbstractVector{<:Real},
@@ -170,15 +199,18 @@ function reaction_fluxes(
     return fluxes
 end
 
-#=
+"""
     reaction_flux_history(network, history, times, rho, T9; rate_multipliers=nothing)
 
-Calculate reaction fluxes at every saved timestep from `solve_network` output.
-`rho` and `T9` may be constants or functions of time.
+Calculate `F_r(t_n)` (see `reaction_flux`) at every saved timestep from
+`solve_network`/`solve_network_adaptive` output. `rho` and `T9` may be
+constants or functions of time (trajectory profiles), evaluated once per saved
+time via `_profile_value`.
 
 Returns a matrix where `flux_history[n, r]` is the flux of reaction `r` at
-`times[n]`.
-=#
+`times[n]`. This is the per-timestep flux CSV data (`reaction_fluxes.csv` via
+`write_reaction_flux_csv`) and the input to `integrated_fluxes`.
+"""
 function reaction_flux_history(
     network::ReactionNetwork,
     history::AbstractMatrix{<:Real},
@@ -201,12 +233,22 @@ function reaction_flux_history(
     return flux_history
 end
 
-#=
+"""
     integrated_fluxes(times, flux_history)
 
-Integrate reaction flux histories in time using the trapezoid rule.
-Returns one integrated flux per reaction.
-=#
+Integrate reaction flux histories in time using the trapezoid rule, giving the
+total abundance processed through each reaction over the run:
+
+```math
+\\Phi_r = \\int F_r(t)\\, dt \\approx \\sum_n \\tfrac{1}{2}(t_{n+1}-t_n)\\left(F_r(t_n) + F_r(t_{n+1})\\right)
+```
+
+`\\Phi_r` (mol g^-1) is the basis for the "largest abundance residual" flux
+reports: multiplying by mass number `A` and the reaction's net stoichiometric
+change for a species gives that reaction's total contribution to the species'
+mass-fraction change over the run. Returns one integrated flux per reaction,
+ordered like `network.reactions`.
+"""
 function integrated_fluxes(times::AbstractVector{<:Real}, flux_history::AbstractMatrix{<:Real})
     length(times) == size(flux_history, 1) || throw(ArgumentError("times length must match the number of flux-history rows"))
     length(times) >= 2 || throw(ArgumentError("at least two time points are required"))
@@ -220,13 +262,22 @@ function integrated_fluxes(times::AbstractVector{<:Real}, flux_history::Abstract
     return totals
 end
 
-#=
+"""
     energy_generation_rate(network, Y, rho, T9; ...)
 
-Return diagnostic nuclear energy generation in erg g^-1 s^-1 from reaction
-Q-values and instantaneous reaction fluxes. This does not feed back into the
-temperature trajectory.
-=#
+Return diagnostic nuclear energy generation `\\epsilon_{\\mathrm{nuc}}` in
+erg g^-1 s^-1 from reaction Q-values (MeV, from each rate table's `q_value`)
+and instantaneous reaction fluxes:
+
+```math
+\\epsilon_{\\mathrm{nuc}} = N_A \\cdot \\mathrm{MeV\\_to\\_erg} \\sum_r Q_r F_r
+```
+
+This is diagnostic only: it reports how much energy the current abundance
+flow *would* release, but it does not feed back into `T9`/`rho` — single-zone
+PPN evolves the network along a prescribed trajectory, it does not solve
+`dT/dt`.
+"""
 function energy_generation_rate(
     network::ReactionNetwork,
     Y::AbstractVector{<:Real},
@@ -244,12 +295,12 @@ function energy_generation_rate(
     return epsilon * AVOGADRO * MEV_TO_ERG
 end
 
-#=
+"""
     energy_generation_history(network, history, times, rho, T9; ...)
 
-Return diagnostic nuclear energy generation in erg g^-1 s^-1 at every saved
-history row.
-=#
+Return diagnostic nuclear energy generation `\\epsilon_{\\mathrm{nuc}}(t_n)`
+(see `energy_generation_rate`) in erg g^-1 s^-1 at every saved history row.
+"""
 function energy_generation_history(
     network::ReactionNetwork,
     history::AbstractMatrix{<:Real},
@@ -272,12 +323,18 @@ function energy_generation_history(
     return epsilon
 end
 
-#=
+"""
     integrated_energy_generation(times, epsilon_history)
 
-Integrate diagnostic energy generation in time using the trapezoid rule.
-Returns specific energy release in erg g^-1.
-=#
+Integrate diagnostic energy generation in time using the trapezoid rule:
+
+```math
+E_{\\mathrm{nuc}} = \\int \\epsilon_{\\mathrm{nuc}}(t)\\, dt
+```
+
+Returns specific energy release in erg g^-1 over the run (diagnostic only,
+see `energy_generation_rate`).
+"""
 function integrated_energy_generation(times::AbstractVector{<:Real}, epsilon_history::AbstractVector{<:Real})
     length(times) == length(epsilon_history) || throw(ArgumentError("times length must match energy-history length"))
     length(times) >= 2 || throw(ArgumentError("at least two time points are required"))
@@ -295,7 +352,19 @@ end
     species_flux_balance(network, Y, rho, T9; rate_multipliers=nothing)
 
 Calculate instantaneous production, destruction, and net `dY/dt` contributions
-for every species.
+for every species, split out by direction rather than summed as in
+`network_rhs`:
+
+```math
+P_i = \\sum_r \\nu^{\\mathrm{prod}}_{i,r} F_r \\qquad
+D_i = \\sum_r \\nu^{\\mathrm{react}}_{i,r} F_r \\qquad
+\\left(\\frac{dY_i}{dt}\\right)_{\\mathrm{net}} = P_i - D_i
+```
+
+Splitting production from destruction (rather than only the net `dY/dt`) is
+what lets `species_flux_contributions`-style diagnostics identify which
+individual reactions dominate a species' formation versus depletion, even
+when the two nearly cancel.
 
 Returns `(production=..., destruction=..., net=...)`, with vectors ordered like
 `network.species`.
@@ -329,13 +398,17 @@ function species_flux_balance(
     return (production=production, destruction=destruction, net=production .- destruction)
 end
 
-#=
+"""
     reaction_edges(network)
 
-Return a flattened graph-like edge list for diagnostics or external plotting.
-Each edge connects one reactant species to one product species for a reaction.
-This is a graph approximation of the reaction hypergraph.
-=#
+Return a flattened graph-like edge list for diagnostics or external plotting
+(e.g. drawing a reaction-network chart). A reaction with multiple reactants
+and products is really a hyperedge (several inputs to several outputs at
+once); this flattens each reaction into the full reactant x product cross
+product of ordinary from -> to edges, so downstream graph tools that only
+understand simple directed edges can still render it. `reaction_index` lets
+callers map an edge back to its originating reaction (and its flux).
+"""
 function reaction_edges(network::ReactionNetwork)
     edges = NamedTuple[]
     for (reaction_index, reaction) in pairs(network.reactions)
