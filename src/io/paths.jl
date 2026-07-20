@@ -1,14 +1,15 @@
 # Default data-file locations and the fetch_data!() downloader.
 
 
-const DEFAULT_STARLIB_PATH = joinpath(dirname(@__DIR__), "data", "starlib.dat")
-const LEGACY_STARLIB_PATH = joinpath(dirname(@__DIR__), "starlib.dat")
-const DEFAULT_REACLIB_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_v1.0.dat")
-const DEFAULT_REACLIB_IL01_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_il01.dat")
-const DEFAULT_REACLIB_NACR_PATH = joinpath(dirname(@__DIR__), "data", "reaclib_nacr.dat")
-const DEFAULT_ILIADIS2001_PATH = joinpath(dirname(@__DIR__), "data", "iliadis2001_rates.dat")
-const DEFAULT_NACRE_PATH = joinpath(dirname(@__DIR__), "data", "nacre_rates.dat")
-const DEFAULT_AME_PATH = joinpath(dirname(@__DIR__), "data", "ame2020_mass.txt")
+const DEFAULT_STARLIB_PATH = joinpath(_PACKAGE_ROOT, "data", "starlib.dat")
+const LEGACY_STARLIB_PATH = joinpath(_PACKAGE_ROOT, "starlib.dat")
+const DEFAULT_REACLIB_PATH = joinpath(_PACKAGE_ROOT, "data", "reaclib_v1.0.dat")
+const DEFAULT_REACLIB_IL01_PATH = joinpath(_PACKAGE_ROOT, "data", "reaclib_il01.dat")
+const DEFAULT_REACLIB_NACR_PATH = joinpath(_PACKAGE_ROOT, "data", "reaclib_nacr.dat")
+const DEFAULT_ILIADIS2001_PATH = joinpath(_PACKAGE_ROOT, "data", "iliadis2001_rates.dat")
+const DEFAULT_NACRE_PATH = joinpath(_PACKAGE_ROOT, "data", "nacre_rates.dat")
+const DEFAULT_AME_PATH = joinpath(_PACKAGE_ROOT, "data", "ame2020_mass.txt")
+const DEFAULT_WINVNE_PATH = joinpath(_PACKAGE_ROOT, "data", "winvne_v2.0.dat")
 const STARLIB_ROWS_PER_REACTION = 60
 
 function _default_starlib_path()
@@ -86,5 +87,4 @@ function fetch_data!(; force::Bool=false, include_starlib::Bool=true)
     end
 
     return nothing
-
-const DEFAULT_WINVNE_PATH = joinpath(dirname(@__DIR__), "data", "winvne_v2.0.dat")
+end
