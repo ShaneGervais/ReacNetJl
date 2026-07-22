@@ -120,8 +120,14 @@ show exactly what coverage gap exists instead of silently losing data. Pass
 Some targeted STARLIB-derived updates (e.g. `data/starlib/starlib_etr25_2025.txt`)
 are otherwise identical to this format but carry one extra leading summary
 line (`"n reactions = N, n temp coordinates = M"`); pass `skip_lines=1` to
-skip it rather than have it fail as a malformed reaction header. Combine such
-a file with a full library via `override_rate_tables`.
+skip it rather than have it fail as a malformed reaction header. Others
+(`starlib_mc10_082022.txt`, `starlib_mc13_082022.txt`,
+`starlib_mc10_mc13_082022.txt`, `starlib_taly_012025.txt`) additionally carry
+one extra trailing field after the Q-value on the header line (apparently a
+network-inclusion flag, always seen as `1`); pass
+`extra_trailing_fields=1` to shift the source/Q-value/species field indices
+accordingly instead of misreading the flag as the Q-value. Combine such a
+file with a full library via `override_rate_tables`.
 """
 # A handful of newer targeted STARLIB updates (e.g. starlib_etr25_2025.txt)
 # carry an isolated doubled-minus-sign typo on a Q-value field
@@ -132,7 +138,12 @@ function _parse_starlib_float(s::AbstractString)
     return parse(Float64, fixed)
 end
 
-function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsupported::Bool=false, skip_lines::Integer=0)
+function read_starlib(
+    path::AbstractString=_default_starlib_path();
+    warn_unsupported::Bool=false,
+    skip_lines::Integer=0,
+    extra_trailing_fields::Integer=0,
+)
     tables = ReactionRateTable[]
     unsupported_counts = Dict{Int,Int}()
 
@@ -148,12 +159,12 @@ function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsuppo
             isempty(header) && continue
 
             fields = split(header)
-            length(fields) >= 4 || error("Malformed STARLIB header at line $line_number: $header")
+            length(fields) >= 4 + extra_trailing_fields || error("Malformed STARLIB header at line $line_number: $header")
 
             chapter = parse(Int, fields[1])
-            source = fields[end-1]
-            q_value = _parse_starlib_float(fields[end])
-            species = normalize_species_name.(fields[2:end-2])
+            source = fields[end-1-extra_trailing_fields]
+            q_value = _parse_starlib_float(fields[end-extra_trailing_fields])
+            species = normalize_species_name.(fields[2:end-2-extra_trailing_fields])
             if !_supported_starlib_layout(chapter, length(species))
                 unsupported_counts[chapter] = get(unsupported_counts, chapter, 0) + 1
             end
