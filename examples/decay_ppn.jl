@@ -3,10 +3,12 @@ Apply post-processing weak decay to a run_ppn.jl final-state snapshot for a
 given decay time, without re-running the network solve.
 
 Usage:
-    julia --project=. decay_ppn.jl <run_output_dir> <decay_time_seconds> [--rates starlib|iliadis2002]
+    julia --project=. decay_ppn.jl <run_output_dir> <decay_time_seconds> [output_dir] [--rates starlib|iliadis2002]
 
 Reads <run_output_dir>/final_state.csv (written by run_ppn.jl) and writes
-<run_output_dir>/decayed_state_<t>s.csv.
+decayed_state_<t>s.csv into [output_dir] (defaults to <run_output_dir> if
+not given, so the decayed state lands next to the run it came from unless
+you ask for somewhere else).
 =#
 
 using ReacNetJl
@@ -30,7 +32,7 @@ function parse_args(args)
 end
 
 const USAGE = """
-Usage: julia --project=. decay_ppn.jl <run_output_dir> <decay_time_seconds> [--rates starlib|iliadis2002]
+Usage: julia --project=. decay_ppn.jl <run_output_dir> <decay_time_seconds> [output_dir] [--rates starlib|iliadis2002]
 """
 
 positional, rates = parse_args(ARGS)
@@ -39,6 +41,7 @@ length(positional) >= 2 || error(USAGE)
 run_output_dir = positional[1]
 decay_time_s = parse(Float64, positional[2])
 decay_time_s >= 0.0 || error("decay_time_seconds must be non-negative")
+output_dir = length(positional) >= 3 ? positional[3] : run_output_dir
 
 final_state_path = joinpath(run_output_dir, "final_state.csv")
 isfile(final_state_path) || error("no final_state.csv found in $run_output_dir; run run_ppn.jl first")
@@ -68,7 +71,8 @@ result = decay_mass_fractions(tables, final_X, decay_time_s; T9=final_T9)
 
 println("weak reactions used = ", length(result.decay_tables))
 
-decay_path = joinpath(run_output_dir, @sprintf("decayed_state_%.0fs.csv", decay_time_s))
+mkpath(output_dir)
+decay_path = joinpath(output_dir, @sprintf("decayed_state_%.0fs.csv", decay_time_s))
 open(decay_path, "w") do io
     println(io, "species,mass_fraction")
     for (name, value) in sort(collect(result.mass_fractions); by=first)

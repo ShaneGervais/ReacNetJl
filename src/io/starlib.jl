@@ -100,7 +100,7 @@ end
 
 
 """
-    read_starlib(path=DEFAULT_STARLIB_PATH; warn_unsupported=false)
+    read_starlib(path=DEFAULT_STARLIB_PATH; warn_unsupported=false, skip_lines=0)
 
 Read a STARLIB v6-format rate library into `ReactionRateTable` entries.
 
@@ -116,13 +116,32 @@ whose chapter/species-count combination isn't one of the ones
 empty products) rather than dropped, so `starlib_chapter_report` can later
 show exactly what coverage gap exists instead of silently losing data. Pass
 `warn_unsupported=true` to also emit an `@warn` summary immediately.
+
+Some targeted STARLIB-derived updates (e.g. `data/starlib/starlib_etr25_2025.txt`)
+are otherwise identical to this format but carry one extra leading summary
+line (`"n reactions = N, n temp coordinates = M"`); pass `skip_lines=1` to
+skip it rather than have it fail as a malformed reaction header. Combine such
+a file with a full library via `override_rate_tables`.
 """
-function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsupported::Bool=false)
+# A handful of newer targeted STARLIB updates (e.g. starlib_etr25_2025.txt)
+# carry an isolated doubled-minus-sign typo on a Q-value field
+# ("--6.98832e-01" where a single "-" was clearly meant); tolerate it rather
+# than failing the whole file over two malformed characters.
+function _parse_starlib_float(s::AbstractString)
+    fixed = startswith(s, "--") ? "-" * s[3:end] : s
+    return parse(Float64, fixed)
+end
+
+function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsupported::Bool=false, skip_lines::Integer=0)
     tables = ReactionRateTable[]
     unsupported_counts = Dict{Int,Int}()
 
     open(path, "r") do io
-        line_number = 0
+        for _ in 1:skip_lines
+            eof(io) && break
+            readline(io)
+        end
+        line_number = skip_lines
         while !eof(io)
             header = strip(readline(io))
             line_number += 1
@@ -133,7 +152,7 @@ function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsuppo
 
             chapter = parse(Int, fields[1])
             source = fields[end-1]
-            q_value = parse(Float64, fields[end])
+            q_value = _parse_starlib_float(fields[end])
             species = normalize_species_name.(fields[2:end-2])
             if !_supported_starlib_layout(chapter, length(species))
                 unsupported_counts[chapter] = get(unsupported_counts, chapter, 0) + 1
@@ -153,9 +172,9 @@ function read_starlib(path::AbstractString=_default_starlib_path(); warn_unsuppo
                 line_number += 1
                 length(row) >= 3 || error("Malformed STARLIB data row at line $line_number")
 
-                push!(T9, parse(Float64, row[1]))
-                push!(rate, parse(Float64, row[2]))
-                push!(factor_uncertainty, parse(Float64, row[3]))
+                push!(T9, _parse_starlib_float(row[1]))
+                push!(rate, _parse_starlib_float(row[2]))
+                push!(factor_uncertainty, _parse_starlib_float(row[3]))
             end
 
             push!(tables, ReactionRateTable(chapter, reactants, products, source, q_value, T9, rate, factor_uncertainty))

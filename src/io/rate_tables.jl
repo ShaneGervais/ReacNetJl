@@ -76,6 +76,42 @@ function _unique_reaction_tables(tables::AbstractVector{ReactionRateTable})
     return selected
 end
 
+"""
+    override_rate_tables(base_tables, override_tables)
+
+Layer `override_tables` on top of `base_tables`: for each override table,
+replace the base table for the same reaction (matched via
+`_reaction_participant_key`, so reactant/product order doesn't matter), or
+append it if `base_tables` doesn't already have that reaction. Returns the
+merged `Vector{ReactionRateTable}`, preserving `base_tables`' order with
+overrides swapped in place and new reactions appended at the end.
+
+This is the general "newer/targeted rate set supersedes an older full
+library" pattern -- the same idea as `iliadis2002_rate_tables`'s
+paper-table overrides, but reusable for layering e.g. a targeted STARLIB
+update (`data/starlib/starlib_etr25_2025.txt`, read with
+`read_starlib(...; skip_lines=1)`) on top of the full STARLIB v6.10
+snapshot.
+"""
+function override_rate_tables(
+    base_tables::AbstractVector{ReactionRateTable},
+    override_tables::AbstractVector{ReactionRateTable},
+)
+    merged = collect(base_tables)
+    index_by_key = Dict{Any,Int}(_reaction_participant_key(t) => i for (i, t) in pairs(merged))
+    for override in override_tables
+        key = _reaction_participant_key(override)
+        slot = get(index_by_key, key, nothing)
+        if slot === nothing
+            push!(merged, override)
+            index_by_key[key] = length(merged)
+        else
+            merged[slot] = override
+        end
+    end
+    return merged
+end
+
 # Index every table by its `_reaction_participant_key`, for O(1) reverse-rate
 # lookup in `add_reverse_reaction_tables` (is there an explicit table whose
 # reactants/products are this forward reaction's products/reactants,
