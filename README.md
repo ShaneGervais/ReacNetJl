@@ -66,26 +66,56 @@ Implemented so far:
 - one-call `run_ppn(trajectory, abundances; rates=..., screening=...)` post-processing API
 - optional high-order stiff integration via the OrdinaryDiffEqBDF package extension (`solve_network_fbdf`, `run_ppn(...; method=:fbdf)`)
 - a PrecompileTools workload so fresh sessions start with the solver hot path already compiled
-- REPL docstrings for the public API (`?run_ppn`, `?iliadis2002_rate_tables`, ...)
-- tests for parsing, interpolation, fluxes, RHS calculation, time evolution, solver equivalence, and user-facing workflows
+- REPL docstrings with equations for essentially every function in `src/` (physics, io, and solver), not just the public API
+- named-reaction rate factoring: `find_reaction_indices` looks up a reaction by label (e.g. `"22Na(p,γ)23Mg"`), `rate_multipliers_from_factors` builds a deterministic per-reaction multiplier vector, and `run_ppn(...; rate_factors=Dict("22Na(p,γ)23Mg" => 2.0))` applies it directly -- the Iliadis-(2002)-style single-rate sensitivity mechanism (Table 8 varies individual rates by 2, 0.5, 10, 0.1, ...)
+- per-reaction STARLIB/NACRE lognormal Monte Carlo sampling for one or a few *named* reactions (`sample_rate_p_values`, `run_ppn(...; rate_sample_labels=[...])`), independent of `run_monte_carlo`'s whole-network sampling
+- `override_rate_tables(base, override)`: layer a newer/targeted rate set on top of a full library, matched order-insensitively by reactant/product participants -- the mechanism behind both the Iliadis-2002 paper-table overrides and layering newer STARLIB updates (e.g. an `etr25`-style targeted remeasurement) on top of a base library
+- `read_starlib(...; skip_lines=, extra_trailing_fields=)` for reading targeted STARLIB-derived update files that carry a leading summary line and/or an extra per-reaction header field beyond the standard v6 layout
+- `write_integrated_flux_csv`/`integrated_fluxes.csv`: one row per reaction with its flux integrated over the whole run, for an at-a-glance "what dominated" summary alongside the full per-timestep `reaction_fluxes.csv`
+- reaction identity (dedup, reverse-rate lookup, paper-table overrides) is reactant/product-order-insensitive throughout, so the same physical reaction listed in a different order by two rate sources can no longer be silently double-counted as two separate network reactions
+- tests for parsing, interpolation, fluxes, RHS calculation, time evolution, solver equivalence, and user-facing workflows (233 tests, `test/runtests.jl`)
 
 ## Reaction-rate data
 
-All rate libraries live in `data/` (see `data/README.md`). The large files are
-not tracked by Git; fetch the REACLIB files with:
+All rate libraries live in `data/`, which is entirely gitignored (the raw
+files are too large and too numerous for Git) except for a single tracked
+archive, `data.zip`. Get everything in one step:
 
 ```sh
-./data/download_rates.sh
+unzip data.zip
 ```
 
-Two rate sources are supported:
+This gives you the full STARLIB v6.10 library, the JINA REACLIB snapshots,
+the raw NPDATA/NACRE-NetGen source material, and the small derived
+paper-tabulated rate overrides (`data/iliadis2001_rates.dat`,
+`data/nacre_rates.dat`) with the scripts that built them
+(`data/scripts/build_iliadis2001_rates.jl`, `build_nacre_rates.jl`) --
+reproducible from their original sources if the raw material is ever updated.
+
+If you only need the essentials (no NPDATA/NetGen extras, no paper-tabulated
+overrides), fetch just the directly-downloadable files instead:
+
+```julia
+using ReacNetJl
+ReacNetJl.fetch_data!()   # REACLIB (ReaclibV1.0 + current default), winvne, AME2020, STARLIB v6.10
+```
+
+Rate sources supported:
 
 - **STARLIB** (`data/starlib.dat`): tabulated rates with factor uncertainties,
-  used for Monte Carlo uncertainty sampling.
+  used for Monte Carlo uncertainty sampling. Targeted STARLIB-derived updates
+  (e.g. a newer remeasurement of a handful of reactions) can be read with
+  `read_starlib(path; skip_lines=..., extra_trailing_fields=...)` and layered
+  onto a full library with `override_rate_tables`.
 - **JINA REACLIB**: analytic fits evaluated onto the STARLIB temperature grid.
-  `data/reaclib_v1.0.dat` is the frozen ReaclibV1.0 snapshot,
-  `data/reaclib_il01.dat` and `data/reaclib_nacr.dat` are the complete
-  Iliadis 2001 and NACRE fit sets held by the JINA database.
+  `data/reaclib_v1.0.dat` is the frozen ReaclibV1.0 snapshot, which already
+  contains the complete Iliadis 2001 and NACRE fit sets used below.
+- **Paper-tabulated overrides** (`data/iliadis2001_rates.dat`,
+  `data/nacre_rates.dat`, read via `read_iliadis2001_rates`/
+  `read_nacre_rates`): the literal published rate values from Iliadis et al.
+  (2001) and NACRE (Angulo et al. 1999), used to override the REACLIB fits of
+  the same reactions where the two differ -- REACLIB's own fit for a given
+  label doesn't always match its source paper closely at nova temperatures.
 
 The Iliadis et al. (2002, ApJS 142, 105) nova baseline is built with:
 
@@ -111,12 +141,40 @@ rates, validation, adaptive implicit solve):
 using ReacNetJl
 
 result = run_ppn("trajectory.input", "initial_abundance.dat";
-                 rates=:iliadis2002, screening=:chugunov)
+                 rates=:iliadis2002, screening=:chugunov,
+                 output_dir="outputs/run")
 
 result.final_mass_fractions
 result.solver_stats
 result.rate_policy_report.counts
+result.output_files   # mass_fractions.csv, reaction_fluxes.csv, integrated_fluxes.csv, network.csv
 ```
+
+Pass `rate_factors=Dict("22Na(p,γ)23Mg" => 2.0)` for a deterministic
+sensitivity-study factor on one named reaction, or
+`rate_sample_labels=["16O(p,γ)17F"]` to sample that reaction's rate from its
+own STARLIB/NACRE lognormal factor uncertainty instead (fixed for the run;
+pass your own `rng=MersenneTwister(seed)` for reproducibility). Both leave
+every other reaction at its nominal rate.
+
+`examples/run_ppn.jl` and `examples/decay_ppn.jl` wrap this into ready-to-run
+CLI scripts:
+
+```sh
+julia --project=. examples/run_ppn.jl trajectory.input initial_abundance.dat outputs/run \
+    --option 1 --screening chugunov --factor "22Na(p,g)23Mg=2.0"
+
+julia --project=. examples/decay_ppn.jl outputs/run 7200 outputs/decay
+```
+
+`--option` selects the rate library cumulatively: `1` = Iliadis (2002)'s own
+NACRE+Iliadis-2001 baseline, `2` = option 1 with a targeted ~2013-era STARLIB
+update layered on top, `3` = option 2 with the most up-to-date targeted
+update layered on top again (see `examples/rate_options.jl`) -- the reaction
+*set* stays identical across all three so the comparison isolates how much
+the rate *values* have changed over time. `run_ppn.jl` saves which option it
+used inside `outputs/run/final_state.csv`, so `decay_ppn.jl` matches it
+automatically unless you pass `--option` explicitly to override.
 
 For label-driven interactive experiments, use `solve_single_zone`:
 
@@ -355,16 +413,19 @@ for the same initial composition, thermodynamic history, and decay convention.
 
 Tasks:
 
-- Reconstruct or replace the digitized `trajectory.input` with the actual
-  one-zone thermodynamic history used for the Iliadis comparison.
-- Track final-state and post-decay residuals against
-  `outputs/iliadis2002_jch1/iso_massf00000.DAT`.
-- Use the integrated flux report to identify whether each major residual is
-  caused by trajectory mismatch, missing rate data, missing reaction channels,
-  or solver/network behavior.
-- Add a stable comparison artifact for notebooks: isotope, reference mass
-  fraction, model mass fraction, ratio, log residual, group, and active/inert
-  status.
+- Done: reproduced the JCH1 case's actual trajectory and initial composition
+  (Iliadis et al. 2002 Table 2) and confirmed the decayed baseline matches
+  Table 4's JCH1 column to within a similar or better residual than an
+  independently-run NuGrid `nuppn` baseline for the same case -- the
+  trust-building comparison this milestone was aiming for.
+- Done (mechanism): `integrated_fluxes.csv` (per `run_ppn`) gives the
+  per-reaction integrated flux needed to attribute a residual to a specific
+  dominant production/destruction channel.
+- Open: a tracked, in-repo comparison notebook. The current comparison work
+  lives outside the public package (a private, git-ignored sensitivity-study
+  area) since it depends on externally-sourced reference data
+  (Iliadis 2002's tables, a `nuppn` baseline run) that isn't part of
+  ReacNetJl itself.
 
 ### Milestone 2: H-Ca network completeness audit
 
@@ -376,11 +437,16 @@ Tasks:
 
 - Keep the H-Ca selector close to the Iliadis isotope/reaction scope without
   silently adding irrelevant heavy-ion or neutron-only channels.
-- Produce a tracked network audit table for selected, skipped, unsupported, and
-  missing STARLIB rows.
-- Separate skipped rows by reason: unsupported chapter layout, no active
-  species path, disintegration bookkeeping, neutron-induced branch, heavy-ion
-  branch, or missing rate data.
+- Done (mechanism): `select_h_ca_reaction_tables`'s candidacy/reachability
+  decisions can be re-derived and inspected per reaction (candidate filter
+  failure vs. a valid-but-unreachable candidate) to build exactly this kind
+  of audit for a given seed composition.
+- Done (initial finding): for the JCH1 case's seed composition, every
+  excluded reaction was legitimately out of scope (a heavy-ion fusion
+  channel far above nova temperatures, or an exotic proton/neutron drip-line
+  species that would never be populated) -- no missing-coverage gaps found
+  for that specific case. This doesn't rule out gaps for other
+  compositions/temperature ranges.
 - Add tests that pin the expected parser behavior for multiproduct weak decays,
   pp-chain light-particle reactions, and common nova breakout branches.
 
@@ -397,11 +463,17 @@ Tasks:
   network and prefers explicit REACLIB reverse fits of the chosen label over
   generated detailed-balance rates in `--rates iliadis2002` mode.
 - Done: the compilation coverage gap is closed with tabulated rates extracted
-  from the papers themselves (`data/iliadis2001_rates.dat`, all 55 reactions;
-  `data/nacre_rates.dat`, 72 of 86 with lower/upper limits as factor
-  uncertainties), cross-validated against the independent JINA fits and
-  applied as `il01tab`/`nacrtab` overrides by `iliadis2002_rate_tables()`.
-  See `data/README.md` for the validation methodology.
+  from the papers/NetGen distributions themselves (`data/iliadis2001_rates.dat`,
+  54 reactions from Iliadis et al. 2001 Tables 3-9; `data/nacre_rates.dat`,
+  85 of NACRE's 89 tabulated reactions with lower/upper limits as factor
+  uncertainties, from the NACRE-project NetGen distribution), applied as
+  `il01tab`/`nacrtab` overrides by `iliadis2002_rate_tables()`. Concretely
+  confirmed to matter: REACLIB's own fit for `22Ne(p,γ)23Na` was
+  300-36,000x faster than Iliadis (2001)'s recommended rate across the
+  T9=0.05-0.25 range that dominates a nova's peak burn.
+- Done: `override_rate_tables` generalizes the same "targeted update
+  supersedes a full library" pattern for layering newer STARLIB-derived
+  measurements (e.g. an `etr25`-style update) onto a base library.
 - Open: identify the h-burning and He-burning reactions whose STARLIB rates
   are missing or clearly not suitable for the Iliadis baseline.
 
@@ -437,8 +509,11 @@ Tasks:
   `run_ppn(...; method=:fbdf)`. Plain ReacNetJl carries no heavy solver
   dependencies.
 - Move to sparse factorization once networks exceed a few hundred species.
-- Add optional flux-history and energy-history CSV outputs beside the
-  mass-fraction CSV.
+- Done: `run_ppn(...; output_dir=...)` writes `reaction_fluxes.csv`
+  (full per-timestep flux history) and `integrated_fluxes.csv` (one row per
+  reaction, integrated over the whole run) beside `mass_fractions.csv`.
+  Energy-history CSV output is still open (`energy_generation_history` is
+  implemented but not yet wired into `run_ppn`'s CSV writer).
 - Track Newton failure modes by timestep, temperature, density, and dominant
   reaction flux.
 - Evaluate whether SciML/DifferentialEquations.jl is worth adding once the
