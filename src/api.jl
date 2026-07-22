@@ -182,24 +182,50 @@ adaptive backward-Euler solver and analytic Jacobian.
 - `max_fractional_change`, `max_absolute_change`, `abundance_floor`,
   `max_newton_iterations`, `max_steps`: adaptive controller settings,
   defaulting to the values validated by the nova example driver.
-- `output_dir`: when given, write three CSVs there and create the directory
+- `output_dir`: when given, write four CSVs there and create the directory
   if needed: `mass_fractions.csv` (mass fraction of every network species at
   every saved trajectory state), `reaction_fluxes.csv` (the flux of every
-  reaction at every saved state), and `network.csv` (the static reaction
-  list: reactants, products, chapter, source, Q-value). This is the
-  "just run it" path — read two input files, pick a solve, say where to
-  write it.
-- `write_reaction_fluxes`: skip the flux-history CSV even when `output_dir`
-  is given (default `true`; the flux pass is one extra RHS evaluation per
-  saved state, cheap next to the solve itself).
+  reaction at every saved state), `integrated_fluxes.csv` (one row per
+  reaction: total flux integrated over the whole run, for an at-a-glance
+  "what dominated" summary), and `network.csv` (the static reaction list:
+  reactants, products, chapter, source, Q-value). This is the "just run it"
+  path — read two input files, pick a solve, say where to write it.
+- `write_reaction_fluxes`: skip the flux-history and integrated-flux CSVs
+  even when `output_dir` is given (default `true`; the flux pass is one
+  extra RHS evaluation per saved state, cheap next to the solve itself).
+- `rate_multipliers`, `rate_p_values`: low-level per-reaction rate
+  adjustment vectors ordered like the built network's reactions (see
+  `network_rhs`); usually easier to reach via `rate_factors`/
+  `rate_sample_labels` below, which resolve reaction labels for you once the
+  network exists.
+- `rate_factors`: a `Dict` (or iterable of pairs) mapping reaction labels to
+  a deterministic multiplicative factor, e.g.
+  `Dict("22Na(p,γ)23Mg" => 2.0)` doubles that one reaction's rate for the
+  whole run while everything else stays nominal (see
+  `rate_multipliers_from_factors`). This is the Iliadis-2002-style
+  single-rate sensitivity mechanism (Table 8 varies individual rates by
+  2, 0.5, 10, 0.1, ...). Mutually exclusive with `rate_multipliers`.
+- `rate_sample_labels`: a collection of reaction labels to sample once each
+  from their STARLIB lognormal factor uncertainty (`p ~ Normal(0,1)`,
+  see `sample_rate_p_values`), holding every other reaction at its nominal
+  rate. This is the setup for a future per-reaction Monte Carlo
+  sensitivity-run script: call `run_ppn` repeatedly (with a fresh `rng`
+  draw each time) to build up a distribution for one named reaction's
+  effect. Mutually exclusive with `rate_p_values`.
+- `rng`: the random source for `rate_sample_labels` (default
+  `Random.default_rng()`); pass your own `MersenneTwister(seed)` for
+  reproducible sampling.
 
 # Returns
 A named tuple with the `network`, `trajectory`, solution `times` and
 abundance `history`, `initial_mass_fractions` and `final_mass_fractions`
 dictionaries, `inert_mass_fractions` for species outside the network,
 `solver_stats`, `reverse_summary`, the `rate_policy_report` (for
-`rates=:iliadis2002`), the network `validation` report, and (when
-`output_dir` is given) `output_files` naming the CSVs written.
+`rates=:iliadis2002`), the network `validation` report, the actual
+`rate_multipliers`/`rate_p_values` vectors used (resolved from
+`rate_factors`/`rate_sample_labels` if those were given, else whatever was
+passed in directly, else `nothing`), and (when `output_dir` is given)
+`output_files` naming the CSVs written.
 """
 function run_ppn(
     trajectory_path::AbstractString,
@@ -222,6 +248,11 @@ function run_ppn(
     max_steps::Integer=1_000_000,
     output_dir=nothing,
     write_reaction_fluxes::Bool=true,
+    rate_multipliers=nothing,
+    rate_p_values=nothing,
+    rate_factors=nothing,
+    rate_sample_labels=nothing,
+    rng::AbstractRNG=Random.default_rng(),
 )
     trajectory = read_trajectory(trajectory_path)
     profiles = trajectory_profiles(trajectory)
@@ -257,6 +288,15 @@ function run_ppn(
     network = network_from_tables(reverse_summary.tables)
     validation = network_validation_report(network; throw_on_error=true)
 
+    if rate_factors !== nothing
+        rate_multipliers === nothing || throw(ArgumentError("cannot supply both rate_multipliers and rate_factors"))
+        rate_multipliers = rate_multipliers_from_factors(network, rate_factors)
+    end
+    if rate_sample_labels !== nothing
+        rate_p_values === nothing || throw(ArgumentError("cannot supply both rate_p_values and rate_sample_labels"))
+        rate_p_values = sample_rate_p_values(network, rate_sample_labels; rng=rng)
+    end
+
     X0 = Dict(name => value for (name, value) in X_normalized if haskey(network.species_index, name))
     inert_mass_fractions = Dict(name => value for (name, value) in X_normalized if !haskey(network.species_index, name))
     Y0 = abundances_from_mass_fractions(network, X0)
@@ -276,6 +316,8 @@ function run_ppn(
             profiles.rho,
             profiles.T9;
             screening=screening,
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
         )
     else
         solve_network_adaptive(
@@ -296,6 +338,8 @@ function run_ppn(
             dt_max=step_max,
             max_steps=max_steps,
             return_stats=true,
+            rate_multipliers=rate_multipliers,
+            rate_p_values=rate_p_values,
         )
     end
 
@@ -307,11 +351,21 @@ function run_ppn(
         )
         network_path = write_network_csv(joinpath(output_dir, "network.csv"), network)
         flux_path = nothing
+        integrated_flux_path = nothing
         if write_reaction_fluxes
-            flux_history = reaction_flux_history(network, history, times, profiles.rho, profiles.T9; screening=screening)
+            flux_history = reaction_flux_history(
+                network, history, times, profiles.rho, profiles.T9;
+                rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening,
+            )
             flux_path = write_reaction_flux_csv(joinpath(output_dir, "reaction_fluxes.csv"), network, times, flux_history)
+            integrated_flux_path = write_integrated_flux_csv(
+                joinpath(output_dir, "integrated_fluxes.csv"), network, integrated_fluxes(times, flux_history),
+            )
         end
-        output_files = (mass_fractions=mass_fraction_path, network=network_path, reaction_fluxes=flux_path)
+        output_files = (
+            mass_fractions=mass_fraction_path, network=network_path,
+            reaction_fluxes=flux_path, integrated_fluxes=integrated_flux_path,
+        )
     end
 
     return (
@@ -328,6 +382,8 @@ function run_ppn(
         rate_policy_report=rate_policy_report,
         validation=validation,
         output_files=output_files,
+        rate_multipliers=rate_multipliers,
+        rate_p_values=rate_p_values,
     )
 end
 

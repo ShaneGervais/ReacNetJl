@@ -130,7 +130,10 @@ function add_reverse_reaction_tables(
     missing = 0
 
     for table in copy(selected)
-        reverse_key = (Tuple(table.products), Tuple(table.reactants))
+        # Sorted to match _reverse_table_lookup's keys (built via
+        # _reaction_participant_key, which sorts), regardless of this
+        # table's own reactant/product order.
+        reverse_key = (Tuple(sort(table.products)), Tuple(sort(table.reactants)))
         if haskey(reverse_lookup, reverse_key)
             reverse_table = reverse_lookup[reverse_key]
             key = _reaction_participant_key(reverse_table)

@@ -149,7 +149,10 @@ function reaclib_rate(sets::AbstractVector{ReaclibSet}, T9::Real)
     return sum(reaclib_rate(set, T9) for set in sets)
 end
 
-_reaclib_group_key(set::ReaclibSet) = (set.chapter, Tuple(set.reactants), Tuple(set.products), lowercase(set.label), set.reverse)
+# Sorted reactants/products (see _reaction_participant_key) so the same
+# reaction with participants listed in a different order still groups (and
+# later matches/overrides) correctly.
+_reaclib_group_key(set::ReaclibSet) = (set.chapter, Tuple(sort(set.reactants)), Tuple(sort(set.products)), lowercase(set.label), set.reverse)
 
 # Build one `ReactionRateTable` from the fit sets of a single reaction/label
 # group, by evaluating `reaclib_rate` (summed over the group) at every point

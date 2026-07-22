@@ -35,7 +35,11 @@ function iliadis2002_rate_tables(
     by_reaction = Dict{Any,Dict{String,Vector{ReaclibSet}}}()
     for set in deduped_sets
         set.reverse && continue
-        key = (set.chapter, Tuple(set.reactants), Tuple(set.products))
+        # Sorted so the same reaction with reactants/products listed in a
+        # different order (across REACLIB label sets, or vs. the paper-table
+        # overrides applied below) still groups as one reaction instead of
+        # silently becoming two separately-selected, double-counted entries.
+        key = (set.chapter, Tuple(sort(set.reactants)), Tuple(sort(set.products)))
         if !haskey(by_reaction, key)
             by_reaction[key] = Dict{String,Vector{ReaclibSet}}()
             push!(reaction_order, key)
@@ -112,7 +116,10 @@ function iliadis2002_rate_tables(
         for key in order
             group = groups[key]
             representative = first(group)
-            forward_key = (Tuple(representative.products), Tuple(representative.reactants))
+            # Sorted to match the (now sorted) chosen_forward_labels keys
+            # registered above, regardless of this reverse set's own
+            # reactant/product order.
+            forward_key = (Tuple(sort(representative.products)), Tuple(sort(representative.reactants)))
             get(chosen_forward_labels, forward_key, nothing) == lowercase(representative.label) || continue
 
             table = _reaclib_group_table(group, T9_grid)

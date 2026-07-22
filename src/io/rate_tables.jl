@@ -48,8 +48,15 @@ end
 # the same reaction" when merging/de-duplicating tables from different
 # libraries (`_unique_reaction_tables`, `add_reverse_reaction_tables`,
 # `iliadis2002_rate_tables`'s paper-table override matching).
+#
+# Sorted so reactant/product *order* doesn't matter: different rate
+# libraries (or REACLIB label sets vs. hand-tabulated paper overrides) don't
+# consistently list a reaction's participants in the same order (e.g.
+# `["p", "na22"]` vs `["na22", "p"]`), and an order-sensitive key would treat
+# those as two different reactions -- silently double-counting the same
+# physical process once per ordering instead of overriding/deduplicating it.
 function _reaction_participant_key(table::ReactionRateTable)
-    return (Tuple(table.reactants), Tuple(table.products))
+    return (Tuple(sort(table.reactants)), Tuple(sort(table.products)))
 end
 
 # Keep only the first table for each distinct reaction (by

@@ -90,3 +90,43 @@ function write_network_csv(path::AbstractString, network::ReactionNetwork)
     return path
 end
 
+"""
+    write_integrated_flux_csv(path, network, integrated_flux)
+
+Write a one-row-per-reaction summary of total integrated flux (mol g^-1,
+from `integrated_fluxes(times, flux_history)`) over a run, alongside the
+same reaction metadata as `write_network_csv` (label, reactants, products,
+chapter, source, Q-value). Where `reaction_fluxes.csv`
+(`write_reaction_flux_csv`) is a full per-timestep time series (one column
+per reaction, one row per saved time -- large), this is the "which reactions
+mattered most overall" at-a-glance summary: sort by `integrated_flux` to
+find the dominant production/destruction channels for the whole run.
+Returns `path`.
+"""
+function write_integrated_flux_csv(
+    path::AbstractString,
+    network::ReactionNetwork,
+    integrated_flux::AbstractVector{<:Real},
+)
+    length(integrated_flux) == length(network.reactions) ||
+        throw(ArgumentError("integrated_flux length must match the number of network reactions"))
+    mkpath(dirname(path))
+    open(path, "w") do io
+        println(io, "index,reaction,reactants,products,chapter,source,q_value_mev,integrated_flux")
+        for (i, reaction) in pairs(network.reactions)
+            row = [
+                string(i),
+                _csv_quote(reaction_string(reaction)),
+                join(reaction.reactants, "+"),
+                join(reaction.products, "+"),
+                string(reaction.rate_table.chapter),
+                reaction.rate_table.source,
+                @sprintf("%.6f", reaction.rate_table.q_value),
+                @sprintf("%.16E", integrated_flux[i]),
+            ]
+            println(io, join(row, ","))
+        end
+    end
+    return path
+end
+
