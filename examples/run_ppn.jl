@@ -7,10 +7,15 @@ re-running the solve.
 
 Usage:
     julia --project=. run_ppn.jl <trajectory_path> <abundance_path> [output_dir] \
-        [--rates starlib|iliadis2002] [--screening weak|chugunov|none] \
+        [--option 1|2|3] [--screening weak|chugunov|none] \
         [--factor "label=value"]... [--mc-factor "label"]... [--seed N]
 
-Defaults: output_dir="outputs/run_ppn", rates=iliadis2002, screening=chugunov
+Defaults: output_dir="outputs/run_ppn", option=1, screening=chugunov
+
+Rate library options (see rate_options.jl for the full rationale):
+    1 = Iliadis 2002: NACRE (A<20) + Iliadis 2001 (A=20-40)   [default]
+    2 = STARLIB v6.10 (full library)
+    3 = STARLIB v6.10 + etr25 (2025) targeted update
 
 Examples:
     # Double one named reaction's rate for the whole run (Iliadis-2002-style
@@ -23,14 +28,19 @@ Examples:
     # the run with different --seed values to build up a distribution):
     julia --project=. run_ppn.jl trajectory.input initial_abundance.dat \
         --mc-factor "16O(p,g)17F" --seed 7
+
+    # Use the most up-to-date rate library instead of the Iliadis-2002 baseline:
+    julia --project=. run_ppn.jl trajectory.input initial_abundance.dat --option 3
 =#
 
 using ReacNetJl
 using Random
 
+include(joinpath(@__DIR__, "rate_options.jl"))
+
 function parse_args(args)
     positional = String[]
-    rates = :iliadis2002
+    option = 1
     screening = :chugunov
     factors = Dict{String,Float64}()
     mc_labels = String[]
@@ -38,8 +48,8 @@ function parse_args(args)
     i = 1
     while i <= length(args)
         arg = args[i]
-        if arg == "--rates"
-            rates = Symbol(args[i+1])
+        if arg == "--option"
+            option = parse(Int, args[i+1])
             i += 2
         elseif arg == "--screening"
             s = args[i+1]
@@ -62,16 +72,16 @@ function parse_args(args)
             i += 1
         end
     end
-    return positional, rates, screening, factors, mc_labels, seed
+    return positional, option, screening, factors, mc_labels, seed
 end
 
 const USAGE = """
 Usage: julia --project=. run_ppn.jl <trajectory_path> <abundance_path> [output_dir] \\
-    [--rates starlib|iliadis2002] [--screening weak|chugunov|none] \\
+    [--option 1|2|3] [--screening weak|chugunov|none] \\
     [--factor "label=value"]... [--mc-factor "label"]... [--seed N]
 """
 
-positional, rates, screening, factors, mc_labels, seed = parse_args(ARGS)
+positional, option, screening, factors, mc_labels, seed = parse_args(ARGS)
 length(positional) >= 2 || error(USAGE)
 
 trajectory_path = positional[1]
@@ -81,20 +91,29 @@ rng = seed === nothing ? Random.default_rng() : MersenneTwister(seed)
 
 println("trajectory = ", trajectory_path)
 println("abundances = ", abundance_path)
-println("rates      = ", rates)
+println("option     = ", option, "  (", OPTION_DESCRIPTIONS[option], ")")
 println("screening  = ", screening === nothing ? "none" : screening)
 println("output_dir = ", output_dir)
 isempty(factors) || println("factors    = ", factors)
 isempty(mc_labels) || println("mc-factor  = ", mc_labels, "  (seed=", seed === nothing ? "none (non-reproducible)" : seed, ")")
 println()
 
-result = run_ppn(
-    trajectory_path, abundance_path;
-    rates=rates, screening=screening, output_dir=output_dir,
+# Option 1 goes through the rates=:iliadis2002 path so run_ppn still builds
+# and returns a rate_policy_report; options 2/3 pass a prebuilt table list
+# directly (rate_options.jl), which skips that label-selection reporting
+# since it doesn't apply to a plain STARLIB library.
+common_kwargs = (
+    screening=screening,
+    output_dir=output_dir,
     rate_factors=isempty(factors) ? nothing : factors,
     rate_sample_labels=isempty(mc_labels) ? nothing : mc_labels,
     rng=rng,
 )
+result = if option == 1
+    run_ppn(trajectory_path, abundance_path; rates=:iliadis2002, common_kwargs...)
+else
+    run_ppn(trajectory_path, abundance_path; tables=rate_tables_for_option(option), common_kwargs...)
+end
 
 println("validated reactions      = ", result.validation.num_reactions)
 println("network species          = ", length(result.network.species))
@@ -121,6 +140,7 @@ final_state_path = joinpath(output_dir, "final_state.csv")
 open(final_state_path, "w") do io
     println(io, "# final_time_s,", final_time)
     println(io, "# final_T9,", final_T9)
+    println(io, "# option,", option)
     println(io, "species,mass_fraction")
     for (name, value) in sort(collect(final_all); by=first)
         println(io, name, ",", value)
