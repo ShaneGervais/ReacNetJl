@@ -27,10 +27,7 @@ data/ame2020_mass.txt
 # only used one-time to build data/iliadis2001_rates.dat and
 # data/nacre_rates.dat via data/scripts/; those small derived files are what
 # stays tracked). Re-copy from the original NPDATA source if ever needed.
-data/REACLIB/
-data/starlib/
-data/netgen/
-data/neutrinos/
+data/
 
 # Scratch / legacy files
 #notebook.jl
