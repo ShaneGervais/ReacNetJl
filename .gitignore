@@ -13,9 +13,24 @@ __MACOSX/
 *~
 .~lock.*
 
-# Full STARLIB data files are large; keep them outside Git or use Git LFS later.
+# Large/fetchable rate-library data (see ReacNetJl.fetch_data!() and
+# data/download_rates.sh) -- too large for GitHub and always re-derivable,
+# so none of it belongs in Git.
 starlib.dat
+data/reaclib_v1.0.dat
+data/reaclib_default.dat
+data/winvne_v2.0.dat
+data/ame2020_mass.txt
 *.dat.zip
+
+# Raw NPDATA source copies (bulky, not read by any ReacNetJl code directly --
+# only used one-time to build data/iliadis2001_rates.dat and
+# data/nacre_rates.dat via data/scripts/; those small derived files are what
+# stays tracked). Re-copy from the original NPDATA source if ever needed.
+data/REACLIB/
+data/starlib/
+data/netgen/
+data/neutrinos/
 
 # Scratch / legacy files
 #notebook.jl
