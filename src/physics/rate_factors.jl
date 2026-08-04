@@ -98,3 +98,60 @@ function sample_rate_p_values(network::ReactionNetwork, labels; rng::AbstractRNG
     end
     return p_values
 end
+
+"""
+    has_rate_uncertainty(table::ReactionRateTable)
+
+Whether `table` carries real, usable rate-uncertainty information, as
+opposed to the structural default every REACLIB-derived
+(`_reaclib_group_table`) and 2-column paper-tabulated
+(`read_tabulated_rates` without a lower/upper column pair, e.g. our digitized
+Iliadis-2001 table) `ReactionRateTable` gets: `factor_uncertainty` uniformly
+`1.0`, which makes `sampled_rate = rate * 1.0^p == rate` regardless of `p` --
+i.e. "no uncertainty data" and "structurally impossible to perturb" are the
+same condition here. Two kinds of source carry real values: a genuine
+STARLIB rate-grid override (`mc10`/`mc13`/`etr25`/`v6.10`/... via
+`read_starlib`), and NACRE's own paper-tabulated low/recommended/high bounds
+(`nacrtab`, when the 4-column `data/nacre_rates.dat` format was digitized for
+that reaction) -- NACRE's whole methodology is built around publishing those
+three values per reaction, independent of any STARLIB grid.
+"""
+has_rate_uncertainty(table::ReactionRateTable) = any(!=(1.0), table.factor_uncertainty)
+
+"""
+    sample_rate_p_values_all(network; rng=Random.default_rng())
+
+Whole-network STARLIB lognormal Monte Carlo sampling: draws a fresh
+`p ~ Normal(0, 1)` for every reaction that `has_rate_uncertainty`, and holds
+`p = 0` (nominal/recommended rate, unperturbed) for every other reaction --
+typically the majority of a network built from a mixed REACLIB/paper-table/
+STARLIB library, since only reactions with a genuine STARLIB rate-grid
+override carry a real factor uncertainty at all.
+
+This is the network-selection-aware counterpart to the lower-level
+`run_monte_carlo` solver driver (which samples every reaction unconditionally
+at fixed T9/rho -- harmless there too, since `factor_uncertainty=1` makes the
+unsampled reactions' draws inert, just without the accounting this function
+provides). Returns a named tuple:
+
+  - `p_values`: the vector, ready for `run_ppn(...; rate_p_values=...)`.
+  - `sampled_reactions` / `unsampled_reactions`: `reaction_string.(...)` labels,
+    so a caller can report -- once, not per trial -- which reactions actually
+    have STARLIB uncertainty data to draw from and which were left at their
+    nominal rate for lack of it.
+"""
+function sample_rate_p_values_all(network::ReactionNetwork; rng::AbstractRNG=Random.default_rng())
+    p_values = zeros(Float64, length(network.reactions))
+    sampled_reactions = String[]
+    unsampled_reactions = String[]
+    for (i, reaction) in pairs(network.reactions)
+        label = reaction_string(reaction)
+        if has_rate_uncertainty(reaction.rate_table)
+            p_values[i] = randn(rng)
+            push!(sampled_reactions, label)
+        else
+            push!(unsampled_reactions, label)
+        end
+    end
+    return (p_values=p_values, sampled_reactions=sampled_reactions, unsampled_reactions=unsampled_reactions)
+end

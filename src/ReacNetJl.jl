@@ -84,7 +84,9 @@ export Species,
     write_integrated_flux_csv,
     find_reaction_indices,
     rate_multipliers_from_factors,
-    sample_rate_p_values
+    sample_rate_p_values,
+    has_rate_uncertainty,
+    sample_rate_p_values_all
 
 # `@__DIR__` is resolved per source file, not per module, so it must be
 # captured once here (where it correctly means the package's src/ directory)

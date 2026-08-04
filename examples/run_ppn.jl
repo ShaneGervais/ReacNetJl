@@ -8,7 +8,7 @@ re-running the solve.
 Usage:
     julia --project=. run_ppn.jl <trajectory_path> <abundance_path> [output_dir] \
         [--option 1|2|3] [--screening weak|chugunov|none] \
-        [--factor "label=value"]... [--mc-factor "label"]... [--seed N]
+        [--factor "label=value"]... [--mc-factor "label"]... [--mc-all] [--seed N]
 
 Defaults: output_dir="outputs/run_ppn", option=1, screening=chugunov
 
@@ -29,6 +29,13 @@ Examples:
     julia --project=. run_ppn.jl trajectory.input initial_abundance.dat \
         --mc-factor "16O(p,g)17F" --seed 7
 
+    # Whole-network Monte Carlo trial: every reaction with real STARLIB/NACRE
+    # uncertainty data gets its own p ~ Normal(0,1); everything else (no
+    # uncertainty digitized) stays nominal. One trial per --seed value --
+    # see SensitivityStudy/run_monte_carlo.jl for the multi-trial driver.
+    julia --project=. run_ppn.jl trajectory.input initial_abundance.dat \
+        --option 3 --mc-all --seed 1
+
     # Use the most up-to-date rate library instead of the Iliadis-2002 baseline:
     julia --project=. run_ppn.jl trajectory.input initial_abundance.dat --option 3
 =#
@@ -44,6 +51,7 @@ function parse_args(args)
     screening = :chugunov
     factors = Dict{String,Float64}()
     mc_labels = String[]
+    mc_all = false
     seed = nothing
     i = 1
     while i <= length(args)
@@ -64,6 +72,9 @@ function parse_args(args)
         elseif arg == "--mc-factor"
             push!(mc_labels, args[i+1])
             i += 2
+        elseif arg == "--mc-all"
+            mc_all = true
+            i += 1
         elseif arg == "--seed"
             seed = parse(Int, args[i+1])
             i += 2
@@ -72,17 +83,18 @@ function parse_args(args)
             i += 1
         end
     end
-    return positional, option, screening, factors, mc_labels, seed
+    return positional, option, screening, factors, mc_labels, mc_all, seed
 end
 
 const USAGE = """
 Usage: julia --project=. run_ppn.jl <trajectory_path> <abundance_path> [output_dir] \\
     [--option 1|2|3] [--screening weak|chugunov|none] \\
-    [--factor "label=value"]... [--mc-factor "label"]... [--seed N]
+    [--factor "label=value"]... [--mc-factor "label"]... [--mc-all] [--seed N]
 """
 
-positional, option, screening, factors, mc_labels, seed = parse_args(ARGS)
+positional, option, screening, factors, mc_labels, mc_all, seed = parse_args(ARGS)
 length(positional) >= 2 || error(USAGE)
+mc_all && !isempty(mc_labels) && error("--mc-all and --mc-factor are mutually exclusive")
 
 trajectory_path = positional[1]
 abundance_path = positional[2]
@@ -96,6 +108,7 @@ println("screening  = ", screening === nothing ? "none" : screening)
 println("output_dir = ", output_dir)
 isempty(factors) || println("factors    = ", factors)
 isempty(mc_labels) || println("mc-factor  = ", mc_labels, "  (seed=", seed === nothing ? "none (non-reproducible)" : seed, ")")
+mc_all && println("mc-all     = true  (seed=", seed === nothing ? "none (non-reproducible)" : seed, ")")
 println()
 
 # Option 1 goes through the rates=:iliadis2002 path so run_ppn still builds
@@ -107,6 +120,7 @@ common_kwargs = (
     output_dir=output_dir,
     rate_factors=isempty(factors) ? nothing : factors,
     rate_sample_labels=isempty(mc_labels) ? nothing : mc_labels,
+    rate_sample_all=mc_all,
     rng=rng,
 )
 result = if option == 1
@@ -120,6 +134,17 @@ println("network species          = ", length(result.network.species))
 println("solver accepted/rejected = ", result.solver_stats.accepted_steps, " / ", result.solver_stats.rejected_steps)
 println("mass drift               = ", result.mass_fraction_drift.initial, " -> ", result.mass_fraction_drift.final)
 println("output files              = ", result.output_files)
+
+if mc_all && result.rate_sample_report !== nothing
+    n_sampled = length(result.rate_sample_report.sampled_reactions)
+    n_unsampled = length(result.rate_sample_report.unsampled_reactions)
+    println("mc-all: ", n_sampled, " reaction(s) sampled from real rate uncertainty; ",
+            n_unsampled, " reaction(s) held at nominal rate for lack of it")
+    println("WARNING: reactions without uncertainty data (kept nominal, not perturbed this trial):")
+    for label in result.rate_sample_report.unsampled_reactions
+        println("  - ", label)
+    end
+end
 
 if !isempty(mc_labels)
     println("sampled p-values:")

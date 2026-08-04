@@ -212,9 +212,15 @@ adaptive backward-Euler solver and analytic Jacobian.
   sensitivity-run script: call `run_ppn` repeatedly (with a fresh `rng`
   draw each time) to build up a distribution for one named reaction's
   effect. Mutually exclusive with `rate_p_values`.
-- `rng`: the random source for `rate_sample_labels` (default
-  `Random.default_rng()`); pass your own `MersenneTwister(seed)` for
-  reproducible sampling.
+- `rate_sample_all::Bool`: whole-network STARLIB lognormal Monte Carlo for
+  one trial (see `sample_rate_p_values_all`) -- every reaction that carries
+  real rate-uncertainty information gets a fresh `p ~ Normal(0,1)`, every
+  other reaction stays nominal. Mutually exclusive with `rate_p_values`/
+  `rate_sample_labels`; the reactions actually sampled vs. held fixed for
+  lack of uncertainty data are reported back in `rate_sample_report`.
+- `rng`: the random source for `rate_sample_labels`/`rate_sample_all`
+  (default `Random.default_rng()`); pass your own `MersenneTwister(seed)`
+  for reproducible sampling.
 
 # Returns
 A named tuple with the `network`, `trajectory`, solution `times` and
@@ -223,9 +229,11 @@ dictionaries, `inert_mass_fractions` for species outside the network,
 `solver_stats`, `reverse_summary`, the `rate_policy_report` (for
 `rates=:iliadis2002`), the network `validation` report, the actual
 `rate_multipliers`/`rate_p_values` vectors used (resolved from
-`rate_factors`/`rate_sample_labels` if those were given, else whatever was
-passed in directly, else `nothing`), and (when `output_dir` is given)
-`output_files` naming the CSVs written.
+`rate_factors`/`rate_sample_labels`/`rate_sample_all` if those were given,
+else whatever was passed in directly, else `nothing`), `rate_sample_report`
+(the sampled-vs-unsampled reaction lists from `rate_sample_all`, else
+`nothing`), and (when `output_dir` is given) `output_files` naming the CSVs
+written.
 """
 function run_ppn(
     trajectory_path::AbstractString,
@@ -252,6 +260,7 @@ function run_ppn(
     rate_p_values=nothing,
     rate_factors=nothing,
     rate_sample_labels=nothing,
+    rate_sample_all::Bool=false,
     rng::AbstractRNG=Random.default_rng(),
 )
     trajectory = read_trajectory(trajectory_path)
@@ -295,6 +304,14 @@ function run_ppn(
     if rate_sample_labels !== nothing
         rate_p_values === nothing || throw(ArgumentError("cannot supply both rate_p_values and rate_sample_labels"))
         rate_p_values = sample_rate_p_values(network, rate_sample_labels; rng=rng)
+    end
+    rate_sample_report = nothing
+    if rate_sample_all
+        (rate_p_values === nothing && rate_sample_labels === nothing) ||
+            throw(ArgumentError("cannot combine rate_sample_all with rate_p_values/rate_sample_labels"))
+        sampled = sample_rate_p_values_all(network; rng=rng)
+        rate_p_values = sampled.p_values
+        rate_sample_report = (sampled_reactions=sampled.sampled_reactions, unsampled_reactions=sampled.unsampled_reactions)
     end
 
     X0 = Dict(name => value for (name, value) in X_normalized if haskey(network.species_index, name))
@@ -384,6 +401,7 @@ function run_ppn(
         output_files=output_files,
         rate_multipliers=rate_multipliers,
         rate_p_values=rate_p_values,
+        rate_sample_report=rate_sample_report,
     )
 end
 
