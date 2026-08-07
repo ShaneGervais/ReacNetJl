@@ -1274,3 +1274,64 @@ end
     @test (ground.Z, ground.A) == (isomer.Z, isomer.A) == (13, 26)
     @test ground.name != isomer.name
 end
+
+const HAS_FORWARDDIFF = Base.find_package("ForwardDiff") !== nothing
+HAS_FORWARDDIFF && @eval using ForwardDiff
+
+@testset "type-generic RHS/flux differentiate under ForwardDiff (feature spec Tier 0 #15)" begin
+    if !HAS_FORWARDDIFF
+        @info "ForwardDiff not installed; skipping AD genericity tests"
+        @test_skip false
+    else
+        # Confirms the *kind* of bug this genericity pass fixes: a bare
+        # Float64(::Dual) conversion silently discards derivative
+        # information rather than erroring loudly -- ForwardDiff instead
+        # disallows it outright, which is why every `Float64(rho)`/
+        # `Float64(rate_multipliers[r])` cast that used to sit in the
+        # flux/RHS hot path had to go, not just be "made to work".
+        @test_throws MethodError Float64(ForwardDiff.Dual(1.0, 1.0))
+
+        grid = ReacNetJl.STARLIB_T9_GRID
+        unit = ones(length(grid))
+        capture = ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e2, length(grid)), unit)
+        proton_alpha = ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e2, length(grid)), unit)
+        network = network_from_tables([capture, proton_alpha])
+        Y = abundances_from_mass_fractions(
+            network, Dict("p" => 0.6, "o17" => 0.1, "f18" => 1.0e-4, "he4" => 0.2, "o15" => 0.0); normalize=true,
+        )
+        rho, T9 = 800.0, 0.22
+
+        # dY/dt is linear-homogeneous in rate_multipliers (each reaction's
+        # flux scales with only its own multiplier), so the AD Jacobian at
+        # any point must reproduce dYdt(m) exactly at a *different* m -- a
+        # model-free correctness check that doesn't re-derive the flux
+        # formula by hand.
+        f(m) = network_rhs(Y, network, rho, T9; rate_multipliers=m)
+        m0 = [1.0, 1.0]
+        J = ForwardDiff.jacobian(f, m0)
+        m_test = [2.3, 0.4]
+        @test isapprox(J * m_test, f(m_test); rtol=1.0e-10)
+        @test all(iszero, f(zeros(2)))
+
+        # same check through the cached/compiled path the real solvers use
+        # (backward_euler.jl via _step_cache_at/_cached_network_rhs!) -- this
+        # is the path where `Float64(rate_multipliers[r])` used to sit.
+        function f_cached(m)
+            cache = ReacNetJl._build_step_cache(network, rho, T9; rate_multipliers=m)
+            buffer = zeros(eltype(m), length(Y))
+            return ReacNetJl._cached_network_rhs!(buffer, network, cache, Y)
+        end
+        J_cached = ForwardDiff.jacobian(f_cached, m0)
+        @test isapprox(J_cached, J; rtol=1.0e-10)
+
+        # per-reaction fluxes: off-diagonal terms must vanish exactly, since
+        # each reaction's flux depends only on its own multiplier
+        flux_of(m) = reaction_fluxes(network, Y, rho, T9; rate_multipliers=m)
+        J_flux = ForwardDiff.jacobian(flux_of, m0)
+        base_flux = flux_of(m0)
+        for r in 1:2, s in 1:2
+            expected = r == s ? base_flux[r] : 0.0
+            @test isapprox(J_flux[r, s], expected; atol=1.0e-12, rtol=1.0e-10)
+        end
+    end
+end

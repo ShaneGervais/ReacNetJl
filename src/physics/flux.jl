@@ -1,5 +1,21 @@
 # Reaction fluxes, the network right-hand side, and energy generation.
 
+# The common element type of one RHS/flux-vector evaluation. Ordinarily
+# Float64, but promotes to whatever `Y`, `rho`, or the rate
+# multipliers/samples carry -- in particular a ForwardDiff.Dual, when one of
+# those is itself a differentiation variable -- so a single AD call
+# differentiates the flux/RHS calculation directly, with no separate
+# finite-difference or hand-written adjoint code (Tier 3 in
+# `reacnetjl_feature_spec.md`: exact ∂yield/∂rate sensitivities). Rate
+# tables themselves stay plain Float64 (T9 is not part of this promotion);
+# only the quantities a caller could plausibly hand in as AD duals are.
+_rhs_eltype(Y, rho, rate_multipliers, rate_p_values) = promote_type(
+    eltype(Y),
+    typeof(rho),
+    rate_multipliers === nothing ? Float64 : eltype(rate_multipliers),
+    rate_p_values === nothing ? Float64 : eltype(rate_p_values),
+)
+
 """
     reaction_flux(reaction, Y, species_index, rho, T9; rate_multiplier=1.0)
 
@@ -44,7 +60,7 @@ function reaction_flux(
         abundance_product *= Y[_species_index(species_index, name)]
     end
 
-    density_factor = Float64(rho)^(nreactants - 1)
+    density_factor = rho^(nreactants - 1)
     return density_factor * rate * abundance_product / _symmetry_factor(reaction.reactants)
 end
 
@@ -68,7 +84,7 @@ function _reaction_flux(
         abundance_product *= Y[index]
     end
 
-    density_factor = Float64(rho)^(compiled.nreactants - 1)
+    density_factor = rho^(compiled.nreactants - 1)
     return density_factor * rate * abundance_product / compiled.symmetry_factor
 end
 
@@ -104,7 +120,7 @@ function network_rhs(
     rate_multipliers=nothing,
     rate_p_values=nothing,
 )
-    dYdt = zeros(Float64, length(Y))
+    dYdt = zeros(_rhs_eltype(Y, rho, rate_multipliers, rate_p_values), length(Y))
 
     if rate_multipliers !== nothing && length(rate_multipliers) != length(reactions)
         throw(ArgumentError("rate_multipliers must have the same length as reactions"))
@@ -139,7 +155,7 @@ function network_rhs(
     rate_p_values=nothing,
     screening=nothing,
 )
-    dYdt = zeros(Float64, length(Y))
+    dYdt = zeros(_rhs_eltype(Y, rho, rate_multipliers, rate_p_values), length(Y))
 
     length(Y) == length(network.species) || throw(ArgumentError("Y length must match the number of network species"))
     if rate_multipliers !== nothing && length(rate_multipliers) != length(network.reactions)
@@ -190,7 +206,7 @@ function reaction_fluxes(
         throw(ArgumentError("rate_p_values must have the same length as network.reactions"))
     end
 
-    fluxes = zeros(Float64, length(network.reactions))
+    fluxes = zeros(_rhs_eltype(Y, rho, rate_multipliers, rate_p_values), length(network.reactions))
     for (i, reaction) in pairs(network.reactions)
         multiplier = rate_multipliers === nothing ? 1.0 : rate_multipliers[i]
         p_value = rate_p_values === nothing ? nothing : rate_p_values[i]

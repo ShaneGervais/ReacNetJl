@@ -6,7 +6,7 @@ __MACOSX/
 #Manifest.toml
 #*.ji
 #.julia/
-
+reacnetjl_feature_spec.md
 # Editor / temporary files
 *.swp
 *.swo

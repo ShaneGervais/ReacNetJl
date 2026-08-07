@@ -199,7 +199,7 @@ one Monte Carlo network run.
 function sampled_interpolate_rate(table::ReactionRateTable, T9::Real, p::Real)
     rate = interpolate_rate(table, T9)
     factor_uncertainty = interpolate_factor_uncertainty(table, T9)
-    return rate * factor_uncertainty^Float64(p)
+    return rate * factor_uncertainty^p
 end
 const GENERATED_REVERSE_RATE_FLOOR = 1.0e-300
 const LOG_INTERPOLATION_FLOOR = 1.0e-300

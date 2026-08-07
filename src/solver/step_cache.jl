@@ -13,11 +13,17 @@ the temperature-dependent work is done.
 Custom screening functions cannot be decomposed this way, so
 `_build_step_cache` returns `nothing` for them and callers fall back to the
 uncached path.
+
+`prefactors` is parametrized over `T` (not hardcoded `Float64`) so it can hold
+AD duals when `rate_multipliers`/`rate_p_values` are themselves being
+differentiated (see `_rhs_eltype` in flux.jl and Tier 3 of
+`reacnetjl_feature_spec.md`); `rho`/`T9`/`screening_scale` stay plain `Float64`
+since they are fixed evaluation points here, not differentiation variables.
 =#
-struct NetworkStepCache
+struct NetworkStepCache{T}
     rho::Float64
     T9::Float64
-    prefactors::Vector{Float64}
+    prefactors::Vector{T}
     screening::Symbol
     screening_scale::Float64
 end
@@ -46,13 +52,17 @@ function _build_step_cache(
 
     rho_value = Float64(rho_t)
     T9_value = Float64(T9_t)
-    prefactors = Vector{Float64}(undef, nreactions)
+    prefactor_type = promote_type(
+        rate_multipliers === nothing ? Float64 : eltype(rate_multipliers),
+        rate_p_values === nothing ? Float64 : eltype(rate_p_values),
+    )
+    prefactors = Vector{prefactor_type}(undef, nreactions)
     for r in 1:nreactions
         table = network.reactions[r].rate_table
         compiled = network.compiled_reactions[r]
         p_value = rate_p_values === nothing ? nothing : rate_p_values[r]
         base_rate = p_value === nothing ? interpolate_rate(table, T9_value) : sampled_interpolate_rate(table, T9_value, p_value)
-        multiplier = rate_multipliers === nothing ? 1.0 : Float64(rate_multipliers[r])
+        multiplier = rate_multipliers === nothing ? 1.0 : rate_multipliers[r]
         prefactors[r] = multiplier * base_rate * rho_value^(compiled.nreactants - 1) / compiled.symmetry_factor
     end
 
@@ -75,7 +85,7 @@ end
 # (`cache.screening_scale`, precomputed once per step) times sqrt(zeta)
 # (composition-dependent, recomputed per Y). `_cached_screening_multiplier`
 # then only needs `charge_pair_sum * zeta_scale` per reaction.
-function _screening_zeta_scale(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{Float64})
+function _screening_zeta_scale(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{<:Real})
     cache.screening == :weak || return 0.0
     zeta = _screening_composition_factor(network, Y)
     zeta > 0.0 || return 0.0
@@ -97,7 +107,7 @@ struct ScreeningContext
     plasma_active::Bool
 end
 
-function _screening_context(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{Float64})
+function _screening_context(cache::NetworkStepCache, network::ReactionNetwork, Y::AbstractVector{<:Real})
     if cache.screening == :weak
         return ScreeningContext(_screening_zeta_scale(cache, network, Y), 0.0, 0.0, false)
     elseif cache.screening == :chugunov
@@ -118,7 +128,10 @@ end
 end
 
 # In-place dY/dt with all temperature-dependent factors taken from the cache.
-function _cached_network_rhs!(dYdt::Vector{Float64}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{Float64})
+# `dYdt`/`Y` are generic (not hardcoded `Vector{Float64}`) so this same
+# function differentiates directly under ForwardDiff when `cache.prefactors`
+# (and hence `dYdt`) carries duals -- see `NetworkStepCache`.
+function _cached_network_rhs!(dYdt::AbstractVector{<:Real}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{<:Real})
     fill!(dYdt, 0.0)
     screening_context = _screening_context(cache, network, Y)
 
@@ -148,7 +161,7 @@ the distinct reactant species. The weak-screening multiplier is treated as
 constant with respect to Y; Newton's converged answer is fixed by the exact
 residual alone, so this only shapes the iteration path, not the solution.
 =#
-function _cached_network_jacobian!(J::Matrix{Float64}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{Float64})
+function _cached_network_jacobian!(J::AbstractMatrix{<:Real}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{<:Real})
     fill!(J, 0.0)
     screening_context = _screening_context(cache, network, Y)
 
