@@ -118,7 +118,7 @@ function _backward_euler_step(
     max_newton_iterations > 0 || throw(ArgumentError("max_newton_iterations must be positive"))
     newton_tolerance > 0.0 || throw(ArgumentError("newton_tolerance must be positive"))
     finite_difference_epsilon > 0.0 || throw(ArgumentError("finite_difference_epsilon must be positive"))
-    jacobian in (:analytic, :finite_difference) || throw(ArgumentError("unsupported jacobian=$jacobian; use :analytic or :finite_difference"))
+    jacobian in (:analytic, :finite_difference, :sparse) || throw(ArgumentError("unsupported jacobian=$jacobian; use :analytic, :finite_difference, or :sparse"))
 
     t_next = t + dt
     Y_next = _euler_step(network, Y, t, dt, rho, T9; rate_multipliers=rate_multipliers, rate_p_values=rate_p_values, screening=screening)
@@ -144,7 +144,9 @@ function _backward_euler_step(
     end
 
     use_analytic_jacobian = cache !== nothing && jacobian == :analytic
+    use_sparse_jacobian = cache !== nothing && jacobian == :sparse
     jacobian_buffer = use_analytic_jacobian ? Matrix{Float64}(undef, n, n) : nothing
+    sparse_jacobian_buffer = use_sparse_jacobian ? sparse_jacobian_prototype(network) : nothing
 
     for iteration in 1:max_newton_iterations
         residual_norm = _max_abs(residual)
@@ -158,6 +160,17 @@ function _backward_euler_step(
                 jacobian_buffer[j, j] += 1.0
             end
             jacobian_matrix = jacobian_buffer
+        elseif use_sparse_jacobian
+            # Same Newton matrix as the dense analytic path, assembled at the
+            # network's precomputed sparsity structure instead (see
+            # `_cached_network_jacobian_sparse!`); `colptr`/`rowval` never
+            # change here, only `nzval`.
+            _cached_network_jacobian_sparse!(sparse_jacobian_buffer, network, cache, Y_next)
+            sparse_jacobian_buffer.nzval .*= -dt
+            @inbounds for j in 1:n
+                sparse_jacobian_buffer.nzval[_sparse_nzval_index(sparse_jacobian_buffer, j, j)] += 1.0
+            end
+            jacobian_matrix = sparse_jacobian_buffer
         else
             jacobian_matrix = _backward_euler_jacobian(
                 network,
@@ -177,9 +190,13 @@ function _backward_euler_step(
         # A singular Newton matrix (e.g. dt so large that I - dt*J loses the
         # identity part to rounding along a conserved direction) is a step
         # failure, not a fatal error: report non-convergence so adaptive
-        # drivers shrink dt and retry.
+        # drivers shrink dt and retry. The sparse path routes through
+        # `_sparse_newton_solve` (KLU when the extension is loaded) rather
+        # than SparseArrays' own default `\` (UMFPACK), so which sparse
+        # backend actually solved the system stays explicit rather than an
+        # implicit fallback.
         correction = try
-            jacobian_matrix \ (-residual)
+            use_sparse_jacobian ? _sparse_newton_solve(jacobian_matrix, -residual) : jacobian_matrix \ (-residual)
         catch err
             if err isa LinearAlgebra.SingularException || err isa LinearAlgebra.LAPACKException
                 throw(NewtonConvergenceError(iteration, residual_norm))

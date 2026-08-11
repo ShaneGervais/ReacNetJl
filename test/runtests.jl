@@ -1335,3 +1335,81 @@ HAS_FORWARDDIFF && @eval using ForwardDiff
         end
     end
 end
+
+const HAS_KLU = Base.find_package("KLU") !== nothing
+HAS_KLU && @eval using KLU
+
+@testset "sparse Jacobian pattern and KLU-backed solve (feature spec Tier 0 #2/#3)" begin
+    using SparseArrays
+
+    grid = ReacNetJl.STARLIB_T9_GRID
+    unit_uncertainty = ones(length(grid))
+    capture = ReactionRateTable(4, ["p", "o17"], ["f18"], "test", 5.607, grid, fill(2.0e4, length(grid)), unit_uncertainty)
+    proton_alpha = ReactionRateTable(5, ["p", "f18"], ["he4", "o15"], "test", 2.882, grid, fill(6.0e4, length(grid)), unit_uncertainty)
+    decay = ReactionRateTable(1, ["o15"], ["n15"], "testw", 2.754, grid, fill(4.5e-3, length(grid)), unit_uncertainty)
+    triple_alpha = ReactionRateTable(8, ["he4", "he4", "he4"], ["c12"], "test", 7.275, grid, fill(1.0e-9, length(grid)), unit_uncertainty)
+    network = network_from_tables([capture, proton_alpha, decay, triple_alpha])
+
+    X0 = Dict(
+        "p" => 0.6, "o17" => 0.05, "f18" => 1.0e-4, "he4" => 0.3,
+        "o15" => 1.0e-5, "n15" => 0.0, "c12" => 0.05,
+    )
+    Y = abundances_from_mass_fractions(network, X0; normalize=true)
+    rho, T9 = 500.0, 0.25
+    n = length(network.species)
+
+    # structural pattern: full diagonal always present, exact nonzero count
+    # for this fixture (capture: 3 rows x 2 cols; proton_alpha: 4x2; decay:
+    # 2x1; triple_alpha's single distinct reactant column he4: 2x1 -- 18
+    # unique (row,col) pairs after deduping against the diagonal), and the
+    # pattern must not be a placeholder (all-dense or all-empty).
+    pattern = network.jacobian_sparsity
+    @test all(pattern[i, i] for i in 1:n)
+    @test nnz(pattern) == 18
+    @test 0 < nnz(pattern) < n^2
+
+    cache = ReacNetJl._build_step_cache(network, rho, T9)
+    J_dense = ReacNetJl._cached_network_jacobian!(Matrix{Float64}(undef, n, n), network, cache, Y)
+
+    # every dense-analytic nonzero must be covered by the precomputed pattern
+    # (the reverse -- a few structurally-nonzero-but-numerically-zero entries
+    # -- is legitimate and not tested against)
+    for i in 1:n, j in 1:n
+        J_dense[i, j] == 0.0 || @test pattern[i, j]
+    end
+
+    # sparse assembly must match the dense analytic Jacobian exactly -- same
+    # per-reaction product-rule formula, only the write target differs
+    J_sparse = ReacNetJl._cached_network_jacobian_sparse!(sparse_jacobian_prototype(network), network, cache, Y)
+    @test Matrix(J_sparse) == J_dense
+
+    # out-of-pattern (row, col) must error, not silently no-op -- guards
+    # against a future sparsity-pattern bug masking a missing Jacobian term
+    zero_positions = [(i, j) for i in 1:n, j in 1:n if !pattern[i, j]]
+    if !isempty(zero_positions)
+        i0, j0 = first(zero_positions)
+        @test_throws ArgumentError ReacNetJl._sparse_nzval_index(J_sparse, i0, j0)
+    end
+
+    if !HAS_KLU
+        @info "KLU not installed; skipping sparse-solve physical-accuracy tests"
+        @test_skip false
+    else
+        # physical-accuracy check: jacobian=:sparse (KLU) must reproduce the
+        # already-validated jacobian=:analytic (dense LU) trajectory, not
+        # merely "run without erroring" -- both the adaptive controller and
+        # the fixed-step driver, since both route through _backward_euler_step.
+        tspan = (0.0, 2.0e4)
+        t_dense, h_dense = solve_network_adaptive(network, Y, tspan, 1.0, rho, T9; method=:backward_euler, jacobian=:analytic, dt_max=50.0)
+        t_sparse, h_sparse = solve_network_adaptive(network, Y, tspan, 1.0, rho, T9; method=:backward_euler, jacobian=:sparse, dt_max=50.0)
+        @test t_sparse[end] ≈ t_dense[end]
+        @test all(isfinite, h_sparse)
+        @test isapprox(h_sparse[end, :], h_dense[end, :]; rtol=1.0e-8, atol=1.0e-25)
+
+        tf_dense, hf_dense = solve_network(network, Y, (0.0, 1.0e-6), 1.0e-7, rho, T9; method=:backward_euler)
+        tf_sparse, hf_sparse = solve_network(network, Y, (0.0, 1.0e-6), 1.0e-7, rho, T9; method=:backward_euler, jacobian=:sparse)
+        @test isapprox(hf_sparse[end, :], hf_dense[end, :]; rtol=1.0e-8, atol=1.0e-25)
+
+        @test_throws ArgumentError solve_network(network, Y, (0.0, 1.0e-6), 1.0e-7, rho, T9; method=:backward_euler, jacobian=:bogus)
+    end
+end

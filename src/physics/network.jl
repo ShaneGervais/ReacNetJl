@@ -44,7 +44,10 @@ A single-zone nuclear reaction network.
 
 `species` fixes the order of the abundance vector `Y`. `species_index` maps each
 species name to its position in `Y`, and `reactions` stores the reactions that
-contribute to `dY/dt`.
+contribute to `dY/dt`. `jacobian_sparsity` is the structural (value-free)
+nonzero pattern of `d(dY/dt)/dY`, precomputed once here rather than
+rediscovered every solver step (feature spec Tier 0 #2); see
+`_jacobian_sparsity_pattern` and `sparse_jacobian_prototype`.
 """
 struct ReactionNetwork
     species::Vector{String}
@@ -52,6 +55,7 @@ struct ReactionNetwork
     species_index::Dict{String,Int}
     reactions::Vector{Reaction}
     compiled_reactions::Vector{CompiledReaction}
+    jacobian_sparsity::SparseMatrixCSC{Bool,Int}
 end
 
 function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::AbstractVector{Reaction})
@@ -74,7 +78,36 @@ function ReactionNetwork(species::AbstractVector{<:AbstractString}, reactions::A
     end
 
     compiled_reactions = [_compile_reaction(reaction, species_index, length(normalized_species)) for reaction in normalized_reactions]
-    return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions, compiled_reactions)
+    jacobian_sparsity = _jacobian_sparsity_pattern(length(normalized_species), compiled_reactions)
+    return ReactionNetwork(normalized_species, species_info, species_index, normalized_reactions, compiled_reactions, jacobian_sparsity)
+end
+
+# Structural nonzero pattern of the analytic Jacobian d(dY_i/dt)/dY_j: for
+# reaction r, every reactant column j (compiled.reactant_species_indices)
+# potentially affects every row i the reaction touches, i.e. every reactant
+# and product species of that same reaction (see `_cached_network_jacobian!`,
+# whose dense loop has exactly this (reaction, j, i) structure). The diagonal
+# is always included even for species with no local self-coupling, since the
+# backward-Euler Newton matrix `I - dt*J` needs a diagonal entry to represent
+# regardless of whether the network Jacobian itself happens to populate it.
+function _jacobian_sparsity_pattern(nspecies::Int, compiled_reactions::Vector{CompiledReaction})
+    entries = Set{Tuple{Int,Int}}()
+    for i in 1:nspecies
+        push!(entries, (i, i))
+    end
+
+    for compiled in compiled_reactions
+        affected_rows = Iterators.flatten((compiled.reactant_species_indices, compiled.product_species_indices))
+        for jindex in compiled.reactant_species_indices
+            for iindex in affected_rows
+                push!(entries, (iindex, jindex))
+            end
+        end
+    end
+
+    rows = [e[1] for e in entries]
+    cols = [e[2] for e in entries]
+    return sparse(rows, cols, trues(length(entries)), nspecies, nspecies)
 end
 
 function _factorial(n::Int)

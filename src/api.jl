@@ -174,7 +174,9 @@ adaptive backward-Euler solver and analytic Jacobian.
 - `partition_functions`: `:auto` (default; uses `data/winvne_v2.0.dat` when
   present), `nothing`, or a `PartitionFunctionTable` — applied to generated
   detailed-balance reverse rates.
-- `jacobian`: `:analytic` (default) or `:finite_difference`.
+- `jacobian`: `:analytic` (default, dense), `:finite_difference`, or `:sparse`
+  (assembled at the network's precomputed sparsity pattern; the actual linear
+  solve requires `using KLU`, see `sparse_jacobian_prototype`).
 - `method`: `:backward_euler` (default), `:euler`, `:rk4`, or `:fbdf` for the
   high-order stiff integrator (requires `using OrdinaryDiffEqBDF`).
 - `dt_initial`, `dt_min`, `dt_max`: solver step controls; by default they are

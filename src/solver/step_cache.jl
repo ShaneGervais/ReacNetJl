@@ -196,6 +196,75 @@ function _cached_network_jacobian!(J::AbstractMatrix{<:Real}, network::ReactionN
     return J
 end
 
+"""
+    sparse_jacobian_prototype(network)
+
+A fresh `SparseMatrixCSC{Float64,Int}` sharing `network.jacobian_sparsity`'s
+structure (`colptr`/`rowval`), values zeroed. Pass this as the buffer to
+`_cached_network_jacobian_sparse!`; its structure never changes across calls,
+only `nzval` is overwritten each evaluation (feature spec Tier 0 #2).
+"""
+function sparse_jacobian_prototype(network::ReactionNetwork)
+    pattern = network.jacobian_sparsity
+    return SparseMatrixCSC(pattern.m, pattern.n, copy(pattern.colptr), copy(pattern.rowval), zeros(Float64, nnz(pattern)))
+end
+
+# Binary search for row `row`'s position within column `col`'s `nzrange` --
+# valid because SparseMatrixCSC stores each column's row indices in strictly
+# ascending order. Throws (rather than silently no-op'ing) if `(row, col)`
+# falls outside the precomputed sparsity pattern: that would mean
+# `_jacobian_sparsity_pattern` under-counted a real Jacobian entry, a bug in
+# the pattern, not a normal runtime condition.
+function _sparse_nzval_index(J::SparseMatrixCSC, row::Int, col::Int)
+    range = nzrange(J, col)
+    position = searchsortedfirst(view(J.rowval, range), row)
+    (position <= length(range) && J.rowval[range[position]] == row) ||
+        throw(ArgumentError("(row=$row, col=$col) is not in the Jacobian sparsity pattern"))
+    return range[position]
+end
+
+# Sparse counterpart of `_cached_network_jacobian!`: identical math (same
+# per-reaction product-rule derivative over distinct reactant species), only
+# the write target differs -- accumulate into `J.nzval` at the precomputed
+# sparsity structure's positions instead of a dense `Matrix` cell. `J` must
+# have been built from `network.jacobian_sparsity` (e.g. via
+# `sparse_jacobian_prototype`); the structure (`colptr`/`rowval`) is never
+# touched here, only values.
+function _cached_network_jacobian_sparse!(J::SparseMatrixCSC{Float64,Int}, network::ReactionNetwork, cache::NetworkStepCache, Y::AbstractVector{<:Real})
+    fill!(J.nzval, 0.0)
+    screening_context = _screening_context(cache, network, Y)
+
+    @inbounds for r in eachindex(network.compiled_reactions)
+        compiled = network.compiled_reactions[r]
+        base = cache.prefactors[r] * _cached_reaction_screening(cache, compiled, screening_context)
+        base == 0.0 && continue
+
+        reactant_indices = compiled.reactant_species_indices
+        reactant_counts = compiled.reactant_species_counts
+        for jpos in eachindex(reactant_indices)
+            jindex = reactant_indices[jpos]
+            count_j = reactant_counts[jpos]
+            derivative = Float64(count_j)
+            count_j > 1 && (derivative *= Y[jindex]^(count_j - 1))
+            for kpos in eachindex(reactant_indices)
+                kpos == jpos && continue
+                derivative *= Y[reactant_indices[kpos]]^reactant_counts[kpos]
+            end
+            dflux = base * derivative
+            dflux == 0.0 && continue
+
+            for (index, count) in zip(reactant_indices, reactant_counts)
+                J.nzval[_sparse_nzval_index(J, index, jindex)] -= count * dflux
+            end
+            for (index, count) in zip(compiled.product_species_indices, compiled.product_species_counts)
+                J.nzval[_sparse_nzval_index(J, index, jindex)] += count * dflux
+            end
+        end
+    end
+
+    return J
+end
+
 
 # Evaluate a trajectory quantity at time t, whether it's a constant Real
 # (single-zone experiments with fixed rho/T9) or a callable profile (e.g.

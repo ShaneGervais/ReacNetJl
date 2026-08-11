@@ -3,6 +3,7 @@ module ReacNetJl
 using LinearAlgebra
 using Printf
 using Random
+using SparseArrays
 import Downloads
 using PrecompileTools: @setup_workload, @compile_workload
 
@@ -86,7 +87,8 @@ export Species,
     rate_multipliers_from_factors,
     sample_rate_p_values,
     has_rate_uncertainty,
-    sample_rate_p_values_all
+    sample_rate_p_values_all,
+    sparse_jacobian_prototype
 
 # `@__DIR__` is resolved per source file, not per module, so it must be
 # captured once here (where it correctly means the package's src/ directory)
@@ -115,6 +117,7 @@ include("physics/reaction_string.jl")
 include("physics/validation.jl")
 include("physics/rate_factors.jl")
 include("solver/step_cache.jl")
+include("solver/sparse_solve.jl")
 include("solver/explicit.jl")
 include("solver/backward_euler.jl")
 include("solver/fixed_step.jl")
